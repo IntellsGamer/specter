@@ -1,41 +1,63 @@
 #!/usr/bin/env python3
 """Specter client: SOCKS5 on 127.0.0.1:10867 -> Specter protocol -> server.
 Point v2ray outbound (socks) at 127.0.0.1:10867.
-Fill in SERVER / SPORT / PSK below, then: python3 client.py
+
+Configure (first found wins for each value):
+  1. config.json next to this file (copy config.example.json), or
+     pass a path:  python3 client.py myconfig.json
+  2. env vars: SPECTER_SERVER / SPECTER_PORT / SPECTER_PSK
+
 Toy obfuscation, NOT audited crypto."""
 import hashlib
 import hmac
+import json
 import os
 import socket
 import struct
+import sys
 import threading
 
-SERVER = "YOUR_SERVER_IP"      # e.g. "203.0.113.10"
-SPORT = 43117                  # server port
+DEFAULT_PORT = 43117
 
 
-def _load_psk():
-    raw = os.environ.get("SPECTER_PSK", "")
-    if not raw or "REPLACE" in raw:
+def _load_config():
+    cfg = {}
+    arg_path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
+    candidates = [arg_path] if arg_path else []
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
+    for path in candidates:
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except (OSError, ValueError):
+                raise SystemExit("Specter: cannot parse %s (must be valid JSON)." % path)
+            break
+    server = os.environ.get("SPECTER_SERVER") or cfg.get("server", "")
+    port = os.environ.get("SPECTER_PORT") or cfg.get("port", DEFAULT_PORT)
+    raw = os.environ.get("SPECTER_PSK") or cfg.get("psk", "")
+    if not server or server in ("YOUR_SERVER_IP", "REPLACE_ME"):
         raise SystemExit(
-            "Specter: set your key first:\n"
-            '  PowerShell:  $env:SPECTER_PSK="64_HEX_CHARS_FROM_SERVER"\n'
-            "  Linux/macOS: export SPECTER_PSK=64_HEX_CHARS_FROM_SERVER\n"
-            "Also edit SERVER above to your server IP."
+            "Specter: no server set. Copy client/config.example.json to\n"
+            "client/config.json and fill in server/port/psk — or set\n"
+            "SPECTER_SERVER / SPECTER_PORT / SPECTER_PSK env vars."
         )
     try:
-        key = bytes.fromhex(raw.strip())
+        port = int(port)
+    except (TypeError, ValueError):
+        raise SystemExit("Specter: port must be a number.")
+    if not raw or "REPLACE" in str(raw):
+        raise SystemExit("Specter: no key set (config.json psk or SPECTER_PSK).")
+    try:
+        key = bytes.fromhex(str(raw).strip())
     except ValueError:
-        raise SystemExit("Specter: SPECTER_PSK is not valid hex (need 64 hex chars).")
+        raise SystemExit("Specter: psk is not valid hex (need 64 hex chars).")
     if len(key) != 32:
-        raise SystemExit("Specter: SPECTER_PSK must decode to exactly 32 bytes.")
-    return key
+        raise SystemExit("Specter: psk must decode to exactly 32 bytes.")
+    return server, port, key
 
 
-if SERVER == "YOUR_SERVER_IP":
-    raise SystemExit('Specter: edit SERVER in client.py to your server IP first.')
-
-PSK = _load_psk()
+SERVER, SPORT, PSK = _load_config()
 MAGIC = b"R1\x07\x9d"
 MAXFRAME = 16383
 

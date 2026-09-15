@@ -87,11 +87,16 @@ go build -o specter-server ./server
 ## Run the client
 
 ```bash
-export SPECTER_PSK="<same 64 hex chars>"
-# edit client/client.py: SERVER = "your.server.ip", SPORT = 43117
+cp client/config.example.json client/config.json
+# edit client/config.json: server, port, psk (64 hex chars from server)
 python3 client/client.py
+# or: python3 client/client.py path/to/myconfig.json
 # SOCKS5 now on 127.0.0.1:10867
 ```
+
+Env vars (`SPECTER_SERVER` / `SPECTER_PORT` / `SPECTER_PSK`) override
+config.json if you prefer those. `client/config.json` is git-ignored so
+your key never gets committed.
 
 v2ray outbound example:
 
