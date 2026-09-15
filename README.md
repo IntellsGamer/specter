@@ -115,3 +115,12 @@ v2ray outbound example:
 ## License
 
 MIT — do what you want, don't blame us.
+
+## Transport modes
+
+| Mode  | Config                | Client command        | Use case                      |
+|-------|-----------------------|-----------------------|-------------------------------|
+| `tcp` | `"transport":"tcp"`  | `python3 client/client.py` (default) | Direct path. Fastest when clean. |
+| `udp` | `"transport":"udp"`  | `python3 client/client.py`         | Bypasses networks that throttle TCP or fingerprint SS signatures. Uses per-datagram framing (independent of TCP order/retransmit). |
+
+UDP is selected by setting the config value, not by a separate binary. The server listens on the same configured port (`SPECTER_LISTEN` / `port`) for both TCP and UDP.

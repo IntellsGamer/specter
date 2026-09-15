@@ -1,5 +1,6 @@
 {
   "server": "203.0.113.10",
   "port": 43117,
-  "psk": "REPLACE_WITH_64_HEX_CHARS_FROM_SERVER"
+  "psk": "REPLACE_WITH_64_HEX_CHARS_FROM_SERVER",
+  "transport": "tcp"
 }
