@@ -12,10 +12,30 @@ import threading
 
 SERVER = "YOUR_SERVER_IP"      # e.g. "203.0.113.10"
 SPORT = 43117                  # server port
-PSK = bytes.fromhex(os.environ.get(
-    "SPECTER_PSK",
-    "REPLACE_WITH_64_HEX_CHARS",
-))
+
+
+def _load_psk():
+    raw = os.environ.get("SPECTER_PSK", "")
+    if not raw or "REPLACE" in raw:
+        raise SystemExit(
+            "Specter: set your key first:\n"
+            '  PowerShell:  $env:SPECTER_PSK="64_HEX_CHARS_FROM_SERVER"\n'
+            "  Linux/macOS: export SPECTER_PSK=64_HEX_CHARS_FROM_SERVER\n"
+            "Also edit SERVER above to your server IP."
+        )
+    try:
+        key = bytes.fromhex(raw.strip())
+    except ValueError:
+        raise SystemExit("Specter: SPECTER_PSK is not valid hex (need 64 hex chars).")
+    if len(key) != 32:
+        raise SystemExit("Specter: SPECTER_PSK must decode to exactly 32 bytes.")
+    return key
+
+
+if SERVER == "YOUR_SERVER_IP":
+    raise SystemExit('Specter: edit SERVER in client.py to your server IP first.')
+
+PSK = _load_psk()
 MAGIC = b"R1\x07\x9d"
 MAXFRAME = 16383
 
