@@ -120,7 +120,10 @@ cp client/config.example.json client/config.json
 go build -o specter-client ./client-go && ./specter-client [config.json]
 ```
 
-**Python client (portable, slower):**
+**Python client (legacy, portable, slower):** `client/client.py` — same
+protocol and config, kept for platforms without a Go build. Uses
+`cryptography` (~68 MB/s) if installed, else a pure-Python fallback
+(~0.5 MB/s — browsing only).
 
 ```bash
 python3 client/client.py
@@ -129,9 +132,7 @@ python3 client/client.py
 
 Env vars (`SPECTER_SERVER` / `SPECTER_PORT` / `SPECTER_PSK` /
 `SPECTER_TRANSPORT`) override config.json. `client/config.json` is
-git-ignored so your key never gets committed. The Python client uses
-`cryptography` (~68 MB/s) if installed, else a pure-Python fallback
-(~0.5 MB/s — browsing only).
+git-ignored so your key never gets committed.
 
 v2ray outbound example:
 

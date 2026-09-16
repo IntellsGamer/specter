@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Specter v2 client: SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+"""Specter v2 client (Python, LEGACY — prefer the Go client in ../client-go):
+SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
 Config: config.json next to this file (see config.example.json), or
   python3 client.py other.json. Env SPECTER_SERVER/PORT/PSK/TRANSPORT override.
 AEAD: uses `cryptography` lib if installed, else embedded pure-Python fallback.
