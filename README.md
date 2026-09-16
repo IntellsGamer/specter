@@ -98,19 +98,34 @@ go build -o specter-server ./server
 
 ## Run the client
 
+Two clients, same `client/config.json`, same SOCKS5 on `127.0.0.1:10867`:
+
 ```bash
 cp client/config.example.json client/config.json
 # edit client/config.json: server, port, psk, transport ("tcp" or "udp")
+```
+
+**Go client (fast — ~540 MB/s AEAD, use this):**
+
+```bash
+# Windows: download client-go/specter-client.exe from the repo, put it
+# next to your config.json, double-click (or: specter-client.exe config.json)
+# Linux:
+go build -o specter-client ./client-go && ./specter-client [config.json]
+```
+
+**Python client (portable, slower):**
+
+```bash
 python3 client/client.py
 # or: python3 client/client.py path/to/myconfig.json
-# SOCKS5 now on 127.0.0.1:10867
 ```
 
 Env vars (`SPECTER_SERVER` / `SPECTER_PORT` / `SPECTER_PSK` /
 `SPECTER_TRANSPORT`) override config.json. `client/config.json` is
-git-ignored so your key never gets committed. Install `cryptography`
-(`pip install cryptography`) for ~50× faster AEAD; otherwise a pure-Python
-fallback is used automatically.
+git-ignored so your key never gets committed. The Python client uses
+`cryptography` (~68 MB/s) if installed, else a pure-Python fallback
+(~0.5 MB/s — browsing only).
 
 v2ray outbound example:
 
@@ -122,9 +137,9 @@ v2ray outbound example:
 
 - **TCP, not QUIC** — survives networks that fingerprint and drop QUIC.
 - **Silent close on bad tag** — scanners see a dead port, not an error.
-- **Cleartext lengths** — trades a little metadata for a lot of speed
-  (single XOR pass, no per-frame handshake).
-- **One static Go binary / one Python file** — no dependencies to rot.
+- **Fixed-size records** — 1024 B cells / 1280 B datagrams; lengths and
+  padding hide inside the AEAD.
+- **Small static binaries / one Python file** — almost no dependencies to rot.
 
 ## License
 

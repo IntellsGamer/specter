@@ -1,4 +1,6 @@
 specter-server
+specter-client
+*.exe
 __pycache__/
 *.pyc
 client/config.json
