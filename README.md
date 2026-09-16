@@ -10,11 +10,11 @@ Run the client once and it writes a dummy `config.json` next to itself
 (with a popup when a display is present) — fill in your server details.
 
 
-> **Warning:** Specter is *obfuscation with authentication*, not audited
-> cryptography. Frames use ChaCha20-Poly1305 with per-connection keys, but
-> there is no forward secrecy and the design has not been reviewed. Fine for
-> dodging naive DPI, **not** for protecting secrets from a motivated
-> adversary. Use WireGuard / Trojan for anything sensitive.
+> **Warning:** Specter has real forward secrecy (X25519 + HKDF per
+> connection) and authenticated frames, but the design has not been
+> independently reviewed. Fine for dodging naive DPI, **not** for protecting
+> secrets from a motivated adversary. Use WireGuard / Trojan for anything
+> sensitive.
 
 ## Layout
 
@@ -41,23 +41,30 @@ app → SOCKS5 127.0.0.1:10867 → [Specter/TCP or /UDP] → server → target
    then streams both directions as authenticated fixed-size records.
 3. The server verifies, dials the target, and relays.
 
-## Wire format (v2)
+## Wire format (v3)
 
-All integers big-endian. `PSK` is a 32-byte pre-shared key (both sides).
-Session key: `sk = SHA256(PSK || "specter-v2-key" || hs_nonce)`.
+All integers big-endian. `PSK` is a 32-byte long-term key used **only** as
+HMAC salt and HKDF salt — never directly for encryption. Per-connection
+session key: `sk = HKDF-SHA256(shared, salt=PSK, info="specter-v3")` where
+`shared = X25519(client_eph, server_eph)`. Stealing the PSK later does not
+decrypt past sessions (both ephemerals are discarded afterwards).
 
-### Handshake (client → server)
+### Handshake
+
+Client → server (69 bytes):
 
 | Field   | Size | Value                                              |
 |---------|------|----------------------------------------------------|
-| ver     | 1    | `0x01` (anything else → silent close)              |
+| ver     | 1    | `0x02` (anything else → silent close)              |
 | magic   | 4    | fresh random bytes, every connection               |
 | nonce   | 16   | fresh random bytes (replay cache, 10 min window)   |
-| tag     | 16   | `HMAC-SHA256(PSK, ver \|\| magic \|\| nonce)[0:16]` |
+| ephC    | 32   | client ephemeral X25519 public key                 |
+| tag     | 16   | `HMAC-SHA256(PSK, ver \|\| magic \|\| nonce \|\| ephC)[0:16]` |
 
-37 bytes total over TCP; the target address travels inside the first
-encrypted cell. The server drops mismatches, replays and wrong versions
-silently — like a filtered port.
+Server → client (49 bytes): `ver \|\| ephS(32) \|\|
+HMAC-SHA256(PSK, ver \|\| ephS \|\| ephC \|\| nonce)[0:16]`.
+The client verifies this — a MITM without the PSK cannot complete the
+handshake. Both sides then derive the same `sk` and forget the ephemerals.
 
 ### TCP cells (fixed 1024 bytes)
 
@@ -73,12 +80,25 @@ Fresh random nonce per cell, no counters to desync. First cell's data is
 
 ### UDP datagrams (fixed 1280 bytes)
 
-First datagram of a session:
+First datagram of a session (fixed 1280 B):
 
 ```
-ver(1) magic(4) hs_nonce(16) tag(16) sid(8) seq(4) flags(1)=0x01
-  + AEAD(sk, nonce=hs_nonce[:12], AD=sid||flags||seq, pt)   # pt: atyp+addr+port+pad
+ver(1) magic(4) nonceC(16) ephC(32) tag(16) sid(8) seq(4) flags(1)=0x01
+  + AEAD(sk0, nonce=nonceC[:12], AD=sid||flags||seq, pt)   # pt: atyp+addr+port+pad
 ```
+
+`sk0 = SHA256(PSK || "specter-v3-hs" || nonceC)` protects only this hello
+(the FS key doesn't exist yet). The server dials the target immediately
+and answers with a fixed 1280 B reply:
+
+```
+sid(8) ephS(32) tagS(16) + random pad
+tagS = HMAC-SHA256(PSK, ver || ephS || ephC || nonceC || sid)[0:16]
+```
+
+The client retransmits the hello until the reply arrives (8 s), verifies
+`tagS`, derives `sk`, and starts data. Retransmitted hellos get the reply
+re-sent (idempotent).
 
 Later datagrams:
 

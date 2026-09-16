@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-VERSION = 0x01
+VERSION = 0x02
 DEFAULT_PORT = 43117
 CELL = 1024
 CELL_PT = 996
@@ -23,7 +23,7 @@ CELL_DATA = 994
 DGRAM = 1280
 DGRAM_PT = 1239
 DGRAM_DATA = 1237
-FIRST_PT = 1214
+FIRST_PT = 1182
 UDP_CHUNK = 1200
 UDP_REORDER_MAX = 64
 UDP_GAP_WAIT = 0.3
@@ -191,8 +191,72 @@ except ImportError:
     AEAD_IMPL = "pure-python"
 
 
-def session_key(hs_nonce):
-    return hashlib.sha256(PSK + b"specter-v2-key" + hs_nonce).digest()
+_P25519 = 2 ** 255 - 19
+_A24 = 121665
+
+
+def _clamp(k):
+    b = bytearray(k)
+    b[0] &= 248
+    b[31] &= 127
+    b[31] |= 64
+    return int.from_bytes(bytes(b), "little")
+
+
+def x25519(priv32, pub32):
+    k = _clamp(priv32)
+    u = int.from_bytes(pub32, "little")
+    x1, x2, z2, x3, z3 = u, 1, 0, u, 1
+    swap = 0
+    for t in range(255, -1, -1):
+        kt = (k >> t) & 1
+        swap ^= kt
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = kt
+        A = (x2 + z2) % _P25519
+        AA = (A * A) % _P25519
+        B = (x2 - z2) % _P25519
+        BB = (B * B) % _P25519
+        E = (AA - BB) % _P25519
+        C = (x3 + z3) % _P25519
+        D = (x3 - z3) % _P25519
+        DA = (D * A) % _P25519
+        CB = (C * B) % _P25519
+        x3 = pow((DA + CB) % _P25519, 2, _P25519)
+        z3 = (x1 * pow((DA - CB) % _P25519, 2, _P25519)) % _P25519
+        x2 = (AA * BB) % _P25519
+        z2 = (E * ((AA + _A24 * E) % _P25519)) % _P25519
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    return ((x2 * pow(z2, _P25519 - 2, _P25519)) % _P25519).to_bytes(32, "little")
+
+
+_XBASE = (9).to_bytes(32, "little")
+
+
+def x25519_pub(priv32):
+    return x25519(priv32, _XBASE)
+
+
+def hkdf_sha256(ikm, salt, info, out_len=32):
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out = b""
+    t = b""
+    for i in range(1, (out_len + 31) // 32 + 1):
+        t = hmac.new(prk, t + info + bytes((i,)), hashlib.sha256).digest()
+        out += t
+    return out[:out_len]
+
+
+def fs_key(shared):
+    return hkdf_sha256(shared, PSK, b"specter-v3")
+
+
+def hs_key(hs_nonce):
+    return hashlib.sha256(PSK + b"specter-v3-hs" + hs_nonce).digest()
 
 
 def recvn(s, n):
@@ -224,10 +288,23 @@ def relay_tcp(app, atyp, addr, port):
     try:
         magic = os.urandom(4)
         nonce = os.urandom(16)
-        tag = hmac.new(PSK, bytes((VERSION,)) + magic + nonce, hashlib.sha256).digest()[:16]
-        sk = session_key(nonce)
+        eph_priv = os.urandom(32)
+        eph_pub = x25519_pub(eph_priv)
+        tag = hmac.new(PSK, bytes((VERSION,)) + magic + nonce + eph_pub,
+                       hashlib.sha256).digest()[:16]
         upstream = socket.create_connection((SERVER, SPORT), timeout=10)
-        upstream.sendall(bytes((VERSION,)) + magic + nonce + tag)
+        upstream.settimeout(15)
+        upstream.sendall(bytes((VERSION,)) + magic + nonce + eph_pub + tag)
+        rep = recvn(upstream, 49)
+        if rep[0] != VERSION:
+            return
+        eph_s = rep[1:33]
+        tag_s = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub + nonce,
+                         hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag_s, rep[33:49]):
+            return
+        sk = fs_key(x25519(eph_priv, eph_s))
+        upstream.settimeout(None)
         upstream.sendall(seal_cell(sk, os.urandom(12), bytes((atyp,)) + addr + port))
         app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
 
@@ -280,20 +357,25 @@ def udp_leg(app, atyp, addr, port):
         return
     magic = os.urandom(4)
     hs_nonce = os.urandom(16)
-    tag = hmac.new(PSK, bytes((VERSION,)) + magic + hs_nonce, hashlib.sha256).digest()[:16]
-    sk = session_key(hs_nonce)
+    eph_priv = os.urandom(32)
+    eph_pub = x25519_pub(eph_priv)
+    tag = hmac.new(PSK, bytes((VERSION,)) + magic + hs_nonce + eph_pub,
+                   hashlib.sha256).digest()[:16]
+    sk0 = hs_key(hs_nonce)
     sid = os.urandom(8)
     target = bytes((atyp,)) + addr + port
     dead = threading.Event()
+    sk_box = {}
 
     def first_datagram():
         pt = target + os.urandom(FIRST_PT - len(target))
         ad = sid + b"\x01" + struct.pack(">I", 0)
-        ct = aead_seal(sk, hs_nonce[:12], pt, ad)
-        return (bytes((VERSION,)) + magic + hs_nonce + tag + sid
+        ct = aead_seal(sk0, hs_nonce[:12], pt, ad)
+        return (bytes((VERSION,)) + magic + hs_nonce + eph_pub + tag + sid
                 + struct.pack(">I", 0) + b"\x01" + ct)
 
     def data_datagram(seq, data):
+        sk = sk_box["sk"]
         data = data[:DGRAM_DATA]
         pt = struct.pack(">H", len(data)) + data + os.urandom(DGRAM_PT - 2 - len(data))
         rnonce = os.urandom(12)
@@ -304,7 +386,6 @@ def udp_leg(app, atyp, addr, port):
     def sender():
         seq = 0
         try:
-            us.sendall(first_datagram())
             while not dead.is_set():
                 try:
                     data = app.recv(UDP_CHUNK)
@@ -317,7 +398,7 @@ def udp_leg(app, atyp, addr, port):
         finally:
             dead.set()
 
-    def parse_reply(dg):
+    def parse_reply(dg, sk):
         if len(dg) != DGRAM or dg[:8] != sid:
             return None
         rnonce, flags = dg[8:20], dg[20:21]
@@ -332,6 +413,33 @@ def udp_leg(app, atyp, addr, port):
         return seq, pt[2:2 + ln]
 
     try:
+        # hello + wait for server reply (retransmit hello, fresh session if needed)
+        sk = None
+        start = time.monotonic()
+        us.settimeout(1)
+        hello = first_datagram()
+        while time.monotonic() - start < 8:
+            try:
+                us.sendall(hello)
+            except OSError:
+                return
+            try:
+                dg, _ = us.recvfrom(2048)
+            except socket.timeout:
+                continue
+            if len(dg) != DGRAM or dg[:8] != sid:
+                continue
+            eph_s, tag_s = dg[8:40], dg[40:56]
+            want = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub
+                            + hs_nonce + sid, hashlib.sha256).digest()[:16]
+            if not hmac.compare_digest(want, tag_s):
+                continue
+            sk = fs_key(x25519(eph_priv, eph_s))
+            break
+        if sk is None:
+            return
+        sk_box["sk"] = sk
+        us.settimeout(30)
         app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         t = threading.Thread(target=sender, daemon=True)
         t.start()
@@ -343,7 +451,7 @@ def udp_leg(app, atyp, addr, port):
                 dg, _ = us.recvfrom(2048)
             except socket.timeout:
                 break
-            parsed = parse_reply(dg)
+            parsed = parse_reply(dg, sk)
             if parsed is None:
                 continue
             seq, data = parsed
@@ -422,7 +530,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 10867))
     srv.listen(64)
-    print("specter v2 [%s] socks5 127.0.0.1:10867 -> %s:%d (%s)"
+    print("specter v3 [%s] socks5 127.0.0.1:10867 -> %s:%d (%s)"
           % (AEAD_IMPL, SERVER, SPORT, TRANSPORT), flush=True)
     while True:
         app, _ = srv.accept()

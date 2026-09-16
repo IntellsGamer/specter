@@ -1,6 +1,6 @@
 package main
 
-// Specter v2 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+// Specter v3 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
 // Config: config.json (server/port/psk/transport) or argv path. Env overrides.
 
 import (
@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net"
@@ -19,17 +20,19 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
-	version     = 0x01
+	version     = 0x02
 	cellSize    = 1024
 	cellPT      = 996
 	cellData    = 994
 	dgramSize   = 1280
 	dgramPT     = 1239
 	dgramData   = 1237
-	firstPT     = 1214
+	firstPT     = 1182
 	udpChunk    = 1200
 	udpReorder  = 64
 	udpGapWait  = 300 * time.Millisecond
@@ -105,12 +108,23 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 	return cfg.Server, cfg.Port, b, cfg.Transport
 }
 
-func sessionKey(psk, hsNonce []byte) []byte {
-	h := sha256.New()
-	h.Write(psk)
-	h.Write([]byte("specter-v2-key"))
-	h.Write(hsNonce)
-	return h.Sum(nil)
+func fsKey(psk, shared []byte) []byte {
+	r := hkdf.New(func() hash.Hash { return sha256.New() }, shared, psk, []byte("specter-v3"))
+	out := make([]byte, 32)
+	if _, err := io.ReadFull(r, out); err != nil {
+		panic(err)
+	}
+	return out
+}
+
+func genEphemeral() (priv, pub []byte) {
+	priv = randBytes(32)
+	var err error
+	pub, err = curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		panic(err)
+	}
+	return priv, pub
 }
 
 func randBytes(n int) []byte {
@@ -144,25 +158,49 @@ func tcpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	defer app.Close()
 	magic := randBytes(4)
 	nonce := randBytes(16)
+	ephPriv, ephPub := genEphemeral()
 	m := hmac.New(sha256.New, psk)
 	m.Write([]byte{version})
 	m.Write(magic)
 	m.Write(nonce)
+	m.Write(ephPub)
 	tag := m.Sum(nil)[:16]
-	sk := sessionKey(psk, nonce)
 	up, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
 	if err != nil {
 		return
 	}
 	defer up.Close()
-	hs := make([]byte, 0, 37)
+	hs := make([]byte, 0, 69)
 	hs = append(hs, version)
 	hs = append(hs, magic...)
 	hs = append(hs, nonce...)
+	hs = append(hs, ephPub...)
 	hs = append(hs, tag...)
+	up.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := up.Write(hs); err != nil {
 		return
 	}
+	rep := make([]byte, 49)
+	if _, err := io.ReadFull(up, rep); err != nil {
+		return
+	}
+	if rep[0] != version {
+		return
+	}
+	ephS := rep[1:33]
+	m2 := hmac.New(sha256.New, psk)
+	m2.Write([]byte{version})
+	m2.Write(ephS)
+	m2.Write(ephPub)
+	m2.Write(nonce)
+	if !hmac.Equal(m2.Sum(nil)[:16], rep[33:49]) {
+		return
+	}
+	shared, err := curve25519.X25519(ephPriv, ephS)
+	if err != nil {
+		return
+	}
+	sk := fsKey(psk, shared)
 	tgt := append([]byte{atyp}, addr...)
 	tgt = append(tgt, portb...)
 	if _, err := up.Write(sealCell(sk, randBytes(12), tgt)); err != nil {
@@ -250,23 +288,31 @@ func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	defer us.Close()
 	magic := randBytes(4)
 	hsNonce := randBytes(16)
+	ephPriv, ephPub := genEphemeral()
 	m := hmac.New(sha256.New, psk)
 	m.Write([]byte{version})
 	m.Write(magic)
 	m.Write(hsNonce)
+	m.Write(ephPub)
 	tag := m.Sum(nil)[:16]
-	sk := sessionKey(psk, hsNonce)
+	sk0 := func() []byte {
+		h := sha256.New()
+		h.Write(psk)
+		h.Write([]byte("specter-v3-hs"))
+		h.Write(hsNonce)
+		return h.Sum(nil)
+	}()
 	sid := randBytes(8)
 	target := append([]byte{atyp}, addr...)
 	target = append(target, portb...)
 
-	// first datagram: ver+magic+hs+tag+sid+seq+flags+AEAD (fixed 1280)
+	// first datagram: ver+magic+hs+ephC+tag+sid+seq+flags+AEAD (fixed 1280)
 	fpt := make([]byte, firstPT)
 	copy(fpt, target)
 	if _, err := rand.Read(fpt[len(target):]); err != nil {
 		return
 	}
-	a, _ := chacha20poly1305.New(sk)
+	a, _ := chacha20poly1305.New(sk0)
 	fad := make([]byte, 0, 13)
 	fad = append(fad, sid...)
 	fad = append(fad, 1)
@@ -276,12 +322,47 @@ func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	first = append(first, version)
 	first = append(first, magic...)
 	first = append(first, hsNonce...)
+	first = append(first, ephPub...)
 	first = append(first, tag...)
 	first = append(first, sid...)
 	first = append(first, 0, 0, 0, 0, 1)
 	first = append(first, fct...)
-	if _, err := us.Write(first); err != nil {
-		return
+	var sk []byte
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		us.SetDeadline(time.Now().Add(time.Second))
+		if _, err := us.Write(first); err != nil {
+			return
+		}
+		rep := make([]byte, dgramSize)
+		us.SetDeadline(time.Now().Add(time.Second))
+		n, err := us.Read(rep)
+		if err != nil {
+			if time.Now().After(deadline) {
+				return
+			}
+			continue
+		}
+		rep = rep[:n]
+		if len(rep) != dgramSize || string(rep[:8]) != string(sid) {
+			continue
+		}
+		ephS := rep[8:40]
+		m2 := hmac.New(sha256.New, psk)
+		m2.Write([]byte{version})
+		m2.Write(ephS)
+		m2.Write(ephPub)
+		m2.Write(hsNonce)
+		m2.Write(sid)
+		if !hmac.Equal(m2.Sum(nil)[:16], rep[40:56]) {
+			continue
+		}
+		shared, err := curve25519.X25519(ephPriv, ephS)
+		if err != nil {
+			return
+		}
+		sk = fsKey(psk, shared)
+		break
 	}
 	if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
