@@ -25,11 +25,7 @@ import (
 )
 
 const (
-	version   = 0x02
-	cellSize  = 1024
-	cellPT    = 996
-	cellData  = 994
-	dgramSize = 1280
+	version   = 0x03
 	maxConns  = 1024
 	dialTO    = 10 * time.Second
 	nonceTTL  = 10 * time.Minute
@@ -37,9 +33,29 @@ const (
 	udpGap    = 500 * time.Millisecond
 
 	udpMaxPayload = 1200
-	dgramPT       = 1239
-	firstPT       = 1214
 )
+
+// Record size classes (totals on the wire). TCP records carry a 2-byte
+// length prefix; UDP sizes come from datagram boundaries.
+var tcpClasses = []int{320, 576, 1024, 1420}
+var udpClasses = []int{576, 1024, 1280}
+
+func pickClass(classes []int) int {
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return classes[len(classes)-1]
+	}
+	return classes[int(b[0])%len(classes)]
+}
+
+func validClass(classes []int, total int) bool {
+	for _, c := range classes {
+		if c == total {
+			return true
+		}
+	}
+	return false
+}
 
 var psk = mustPSK()
 
@@ -129,13 +145,16 @@ func nonceSweeper() {
 	}
 }
 
-// ---------- TCP cells (unchanged wire, v3 session key) ----------
+// ---------- TCP records (variable size class + 2B length prefix) ----------
 
-func sealCell(sk, data []byte) []byte {
-	if len(data) > cellData {
-		data = data[:cellData]
+// sealRecord encrypts up to budget-2 bytes into a total-sized record:
+// len u16 (total-2) || rnonce(12) || AEAD(pt=[dlen u16][data][pad]).
+func sealRecord(sk, data []byte, total int) []byte {
+	budget := total - 2 - 12 - 16
+	if len(data) > budget-2 {
+		data = data[:budget-2]
 	}
-	pt := make([]byte, cellPT)
+	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
 	copy(pt[2:], data)
 	if _, err := rand.Read(pt[2+len(data):]); err != nil {
@@ -146,26 +165,48 @@ func sealCell(sk, data []byte) []byte {
 	if _, err := rand.Read(rnonce); err != nil {
 		panic(err)
 	}
-	out := make([]byte, 0, cellSize)
+	out := make([]byte, 0, total)
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(total-2))
+	out = append(out, hdr[:]...)
 	out = append(out, rnonce...)
 	out = append(out, a.Seal(nil, rnonce, pt, nil)...)
 	return out
 }
 
-func openCell(sk, cell []byte) ([]byte, error) {
-	if len(cell) != cellSize {
+// openRecordBody decrypts a record body (nonce+AEAD) of known total.
+func openRecordBody(sk, body []byte, total int) ([]byte, error) {
+	budget := total - 2 - 12 - 16
+	if len(body) != total-2 || budget < 2 {
 		return nil, io.ErrUnexpectedEOF
 	}
 	a, _ := chacha20poly1305.New(sk)
-	pt, err := a.Open(nil, cell[:12], cell[12:], nil)
+	pt, err := a.Open(nil, body[:12], body[12:], nil)
 	if err != nil {
 		return nil, err
 	}
 	ln := int(binary.BigEndian.Uint16(pt[:2]))
-	if ln < 0 || ln > cellData {
+	if ln < 0 || 2+ln > len(pt) {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return pt[2 : 2+ln], nil
+}
+
+// readRecord reads one length-prefixed record, enforcing size classes.
+func readRecord(r io.Reader, sk []byte) ([]byte, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	total := int(binary.BigEndian.Uint16(hdr[:])) + 2
+	if !validClass(tcpClasses, total) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	body := make([]byte, total-2)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	return openRecordBody(sk, body, total)
 }
 
 func parseAddr(buf []byte) (host string, rest []byte, ok bool) {
@@ -249,15 +290,14 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 		return
 	}
 	sk := fsKey(shared)
+	sk0 := hsKey(nonce)
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := c.Write(serverReply(ephSPub, ephC, nonce)); err != nil {
 		return
 	}
-	first := make([]byte, cellSize)
-	if _, err := io.ReadFull(c, first); err != nil {
-		return
-	}
-	tgt, err := openCell(sk, first)
+	// first record carries the target under the hello key (0-RTT: the
+	// client sends hs+target together before seeing our reply)
+	tgt, err := readRecord(c, sk0)
 	if err != nil {
 		return
 	}
@@ -274,12 +314,8 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 	done := make(chan struct{}, 2)
 	go func() {
 		defer func() { done <- struct{}{} }()
-		cell := make([]byte, cellSize)
 		for {
-			if _, err := io.ReadFull(c, cell); err != nil {
-				return
-			}
-			d, err := openCell(sk, cell)
+			d, err := readRecord(c, sk)
 			if err != nil {
 				return
 			}
@@ -291,7 +327,7 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, cellData)
+		buf := make([]byte, 1388)
 		for {
 			t.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := t.Read(buf)
@@ -299,8 +335,17 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 				return
 			}
 			c.SetDeadline(time.Now().Add(3 * time.Minute))
-			if _, err := c.Write(sealCell(sk, buf[:n])); err != nil {
-				return
+			off := 0
+			for off < n {
+				total := pickClass(tcpClasses)
+				end := off + total - 2 - 12 - 16 - 2
+				if end > n {
+					end = n
+				}
+				if _, err := c.Write(sealRecord(sk, buf[off:end], total)); err != nil {
+					return
+				}
+				off = end
 			}
 		}
 	}()
@@ -310,18 +355,20 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 // ---------- UDP ----------
 
 type udpSession struct {
-	target  net.Conn
-	sendSeq uint32
-	expect  uint32
-	pending map[uint32][]byte
-	gapSince time.Time
-	last    time.Time
-	sk      []byte
-	ephS    []byte
-	ephC    []byte
-	hsNonce []byte
-	sid     []byte
-	mu      sync.Mutex
+	target    net.Conn
+	sendSeq   uint32
+	expect    uint32
+	pending   map[uint32][]byte
+	gapSince  time.Time
+	last      time.Time
+	sk        []byte // FS data key
+	sk0       []byte // hello/early key (PSK-derived)
+	peerReady bool   // client proved FS key (first sk datagram seen)
+	ephS      []byte
+	ephC      []byte
+	hsNonce   []byte
+	sid       []byte
+	mu        sync.Mutex
 }
 
 var (
@@ -359,7 +406,8 @@ func lookupSession(sid []byte) (*udpSession, string) {
 }
 
 func openDgram(sk, sid []byte, pkt []byte) (flags byte, seq uint32, data []byte, ok bool) {
-	if len(pkt) < 8+12+1+4+2+16 {
+	// total must be a valid class; pt budget = total-25-16, data ≤ budget-2
+	if !validClass(udpClasses, len(pkt)) || len(pkt) < 8+12+1+4+2+16 {
 		return 0, 0, nil, false
 	}
 	if string(pkt[:8]) != string(sid) {
@@ -382,7 +430,8 @@ func openDgram(sk, sid []byte, pkt []byte) (flags byte, seq uint32, data []byte,
 		return 0, 0, nil, false
 	}
 	ln := int(binary.BigEndian.Uint16(pt[:2]))
-	if ln < 0 || 2+ln > len(pt) {
+	budget := len(pkt) - 25 - 16
+	if ln < 0 || 2+ln > budget || 2+ln > len(pt) {
 		return 0, 0, nil, false
 	}
 	return flags, seq, pt[2 : 2+ln], true
@@ -400,27 +449,45 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s
 		seq := s.sendSeq
 		s.sendSeq++
 		s.last = time.Now()
+		key := sk
+		if !s.peerReady {
+			key = s.sk0
+		}
 		s.mu.Unlock()
-		pt := make([]byte, dgramPT)
-		binary.BigEndian.PutUint16(pt[:2], uint16(n))
-		copy(pt[2:], buf[:n])
-		if _, err := rand.Read(pt[2+n:]); err != nil {
-			break
+		total := pickClass(udpClasses)
+		budget := total - 25 - 16
+		off := 0
+		for off < n {
+			end := off + budget - 2
+			if end > n {
+				end = n
+			}
+			pt := make([]byte, budget)
+			binary.BigEndian.PutUint16(pt[:2], uint16(end-off))
+			copy(pt[2:], buf[off:end])
+			if _, err := rand.Read(pt[2+end-off:]); err != nil {
+				break
+			}
+			rnonce := make([]byte, 12)
+			if _, err := rand.Read(rnonce); err != nil {
+				break
+			}
+			a, _ := chacha20poly1305.New(key)
+			ad := append(append(append([]byte(nil), sid...), 0), uint32be(seq)...)
+			ct := a.Seal(nil, rnonce, pt, ad)
+			out := make([]byte, 0, total)
+			out = append(out, sid...)
+			out = append(out, rnonce...)
+			out = append(out, 0)
+			out = append(out, uint32be(seq)...)
+			out = append(out, ct...)
+			conn.WriteToUDP(out, addr)
+			seq++
+			s.mu.Lock()
+			s.sendSeq = seq
+			s.mu.Unlock()
+			off = end
 		}
-		rnonce := make([]byte, 12)
-		if _, err := rand.Read(rnonce); err != nil {
-			break
-		}
-		a, _ := chacha20poly1305.New(sk)
-		ad := append(append(append([]byte(nil), sid...), 0), uint32be(seq)...)
-		ct := a.Seal(nil, rnonce, pt, ad)
-		out := make([]byte, 0, dgramSize)
-		out = append(out, sid...)
-		out = append(out, rnonce...)
-		out = append(out, 0)
-		out = append(out, uint32be(seq)...)
-		out = append(out, ct...)
-		conn.WriteToUDP(out, addr)
 	}
 	udpMu.Lock()
 	if cur, ok := udpSessions[key]; ok && cur == s {
@@ -498,19 +565,19 @@ func deliverUDP(s *udpSession, seq uint32, data []byte) {
 	}
 }
 
-// helloReply builds the fixed-size server hello response.
-func helloReply(sid, ephS, ephC, nonce []byte) []byte {
+// helloReply builds a class-sized server hello response.
+func helloReply(sid, ephS, ephC, nonce []byte, total int) []byte {
 	m := hmac.New(sha256.New, psk)
 	m.Write([]byte{version})
 	m.Write(ephS)
 	m.Write(ephC)
 	m.Write(nonce)
 	m.Write(sid)
-	out := make([]byte, 0, dgramSize)
+	out := make([]byte, 0, total)
 	out = append(out, sid...)
 	out = append(out, ephS...)
 	out = append(out, m.Sum(nil)[:16]...)
-	pad := make([]byte, dgramSize-len(out))
+	pad := make([]byte, total-len(out))
 	if _, err := rand.Read(pad); err != nil {
 		panic(err)
 	}
@@ -518,38 +585,36 @@ func helloReply(sid, ephS, ephC, nonce []byte) []byte {
 }
 
 func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
-	if len(pkt) != dgramSize {
+	if !validClass(udpClasses, len(pkt)) {
 		return
 	}
 	// data datagram? (with grace for the creation race)
 	if len(pkt) >= 8 {
 		if s, _ := lookupSession(pkt[:8]); s != nil {
-			flags, seq, data, ok := openDgram(s.sk, pkt[:8], pkt)
-			if !ok {
+			if openDeliver(s, pkt) {
 				return
 			}
-			_ = flags
-			deliverUDP(s, seq, data)
 			return
 		}
 		if pkt[0] != version {
 			for i := 0; i < 4; i++ {
 				time.Sleep(50 * time.Millisecond)
 				if s, _ := lookupSession(pkt[:8]); s != nil {
-					flags, seq, data, ok := openDgram(s.sk, pkt[:8], pkt)
-					if !ok {
-						return
-					}
-					_ = flags
-					deliverUDP(s, seq, data)
+					openDeliver(s, pkt)
 					return
 				}
 			}
 			return
 		}
 	}
-	// hello: ver(1) magic(4) nonceC(16) ephC(32) tag(16) sid(8) seq(4) flags(1) AEAD
+	// hello: ver(1) magic(4) nonceC(16) ephC(32) tag(16) sid(8) seq(4)
+	//   flags(1) AEAD[pt = atyp+addr+port+pad, nonce=nonceC[:12]]
 	if pkt[0] != version {
+		return
+	}
+	total := len(pkt)
+	budget := total - 82 - 16 // header 82, tag 16
+	if budget < 2 {
 		return
 	}
 	hsNonce := append([]byte(nil), pkt[5:21]...)
@@ -567,7 +632,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	}
 	if s, _ := lookupSession(sid); s != nil {
 		// hello retransmit (client missed our reply): resend it
-		conn.WriteToUDP(helloReply(s.sid, s.ephS, s.ephC, s.hsNonce), addr)
+		conn.WriteToUDP(helloReply(s.sid, s.ephS, s.ephC, s.hsNonce, pickClass(udpClasses)), addr)
 		return
 	}
 	if nonceSeen(hsNonce) {
@@ -577,7 +642,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	a, _ := chacha20poly1305.New(sk0)
 	ad := append(append(append([]byte(nil), sid...), flags), pkt[77:81]...)
 	pt, err := a.Open(nil, hsNonce[:12], pkt[82:], ad)
-	if err != nil {
+	if err != nil || len(pt) != budget {
 		return
 	}
 	host, rest, ok := parseAddr(pt)
@@ -603,12 +668,38 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 		old.target.Close()
 	}
 	s := &udpSession{target: t, pending: map[uint32][]byte{}, last: time.Now(),
-		sk: append([]byte(nil), sk...), ephS: ephSPub, ephC: ephC,
-		hsNonce: hsNonce, sid: sid}
+		sk: append([]byte(nil), sk...), sk0: append([]byte(nil), sk0...),
+		ephS: ephSPub, ephC: ephC, hsNonce: hsNonce, sid: sid}
 	udpSessions[key] = s
 	udpMu.Unlock()
-	conn.WriteToUDP(helloReply(sid, ephSPub, ephC, hsNonce), addr)
+	conn.WriteToUDP(helloReply(sid, ephSPub, ephC, hsNonce, pickClass(udpClasses)), addr)
 	go udpPump(conn, key, addr, sid, s.sk, s)
+}
+
+// openDeliver opens one data datagram (FS key, or hello key for early
+// traffic) and delivers it.
+func openDeliver(s *udpSession, pkt []byte) bool {
+	s.mu.Lock()
+	sk := s.sk
+	sk0 := s.sk0
+	s.mu.Unlock()
+	if flags, seq, data, ok := openDgram(sk, pkt[:8], pkt); ok {
+		_ = flags
+		s.mu.Lock()
+		s.peerReady = true
+		s.mu.Unlock()
+		deliverUDP(s, seq, data)
+		return true
+	}
+	if sk0 == nil {
+		return false
+	}
+	if flags, seq, data, ok := openDgram(sk0, pkt[:8], pkt); ok {
+		_ = flags
+		deliverUDP(s, seq, data)
+		return true
+	}
+	return false
 }
 
 func udpLoop(uconn *net.UDPConn) {
@@ -624,12 +715,16 @@ func udpLoop(uconn *net.UDPConn) {
 }
 
 func main() {
-	ln, err := net.Listen("tcp", listenAddr())
-	if err != nil {
-		panic(err)
+	mode := os.Getenv("SPECTER_TRANSPORT") // tcp | udp | both (default both)
+	var ln net.Listener
+	if mode != "udp" {
+		var err error
+		ln, err = net.Listen("tcp", listenAddr())
+		if err != nil {
+			panic(err)
+		}
 	}
-	// SPECTER_TRANSPORT=tcp -> TCP only; anything else -> TCP+UDP.
-	if os.Getenv("SPECTER_TRANSPORT") != "tcp" {
+	if mode != "tcp" {
 		uaddr, err := net.ResolveUDPAddr("udp", listenAddr())
 		if err != nil {
 			panic(err)
@@ -639,6 +734,9 @@ func main() {
 			panic(err)
 		}
 		go udpLoop(uconn)
+	}
+	if ln == nil {
+		select {} // UDP-only mode: just wait
 	}
 	go nonceSweeper()
 	go udpReaper()

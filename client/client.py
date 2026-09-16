@@ -15,18 +15,17 @@ import sys
 import threading
 import time
 
-VERSION = 0x02
+VERSION = 0x03
 DEFAULT_PORT = 43117
-CELL = 1024
-CELL_PT = 996
-CELL_DATA = 994
-DGRAM = 1280
-DGRAM_PT = 1239
-DGRAM_DATA = 1237
-FIRST_PT = 1182
+TCP_CLASSES = (320, 576, 1024, 1420)
+UDP_CLASSES = (576, 1024, 1280)
 UDP_CHUNK = 1200
 UDP_REORDER_MAX = 64
 UDP_GAP_WAIT = 0.3
+
+
+def _pick_class(classes):
+    return classes[os.urandom(1)[0] % len(classes)]
 
 
 def _load_config():
@@ -45,8 +44,8 @@ def _load_config():
     server = os.environ.get("SPECTER_SERVER") or cfg.get("server", "")
     port = os.environ.get("SPECTER_PORT") or cfg.get("port", DEFAULT_PORT)
     transport = (os.environ.get("SPECTER_TRANSPORT") or cfg.get("transport", "tcp")).lower()
-    if transport not in ("tcp", "udp"):
-        raise SystemExit('Specter: transport must be "tcp" or "udp".')
+    if transport not in ("tcp", "udp", "auto"):
+        raise SystemExit('Specter: transport must be "tcp", "udp" or "auto".')
     raw = os.environ.get("SPECTER_PSK") or cfg.get("psk", "")
     if (not server or server in ("YOUR_SERVER_IP", "REPLACE_ME")
             or not raw or "REPLACE" in str(raw)):
@@ -269,70 +268,85 @@ def recvn(s, n):
     return b
 
 
-def seal_cell(sk, rnonce, data):
-    data = data[:CELL_DATA]
-    pt = struct.pack(">H", len(data)) + data + os.urandom(CELL_PT - 2 - len(data))
-    return rnonce + aead_seal(sk, rnonce, pt, b"")
+def seal_record(sk, data, total):
+    budget = total - 2 - 12 - 16
+    data = data[:budget - 2]
+    pt = struct.pack(">H", len(data)) + data + os.urandom(budget - 2 - len(data))
+    rnonce = os.urandom(12)
+    return struct.pack(">H", total - 2) + rnonce + aead_seal(sk, rnonce, pt, b"")
 
 
-def open_cell(sk, cell):
-    pt = aead_open(sk, cell[:12], cell[12:], b"")
+def read_record(sock, sk):
+    total = struct.unpack(">H", recvn(sock, 2))[0] + 2
+    if total not in TCP_CLASSES:
+        raise ValueError("bad class")
+    body = recvn(sock, total - 2)
+    pt = aead_open(sk, body[:12], body[12:], b"")
+    budget = total - 2 - 12 - 16
     ln = struct.unpack(">H", pt[:2])[0]
-    if ln > CELL_DATA:
+    if ln > budget - 2:
         raise ValueError("bad len")
     return pt[2:2 + ln]
+
+
+def tcp_handshake(atyp, addr, port):
+    """0-RTT: hs + first record (target, sk0) in one flight. Returns (upstream, sk)."""
+    magic = os.urandom(4)
+    nonce = os.urandom(16)
+    eph_priv = os.urandom(32)
+    eph_pub = x25519_pub(eph_priv)
+    tag = hmac.new(PSK, bytes((VERSION,)) + magic + nonce + eph_pub,
+                   hashlib.sha256).digest()[:16]
+    sk0 = hs_key(nonce)
+    upstream = socket.create_connection((SERVER, SPORT), timeout=10)
+    upstream.settimeout(15)
+    tgt = bytes((atyp,)) + addr + port
+    flight = (bytes((VERSION,)) + magic + nonce + eph_pub + tag
+              + seal_record(sk0, tgt, _pick_class(TCP_CLASSES)))
+    upstream.sendall(flight)
+    rep = recvn(upstream, 49)
+    if rep[0] != VERSION:
+        raise ValueError("bad version")
+    eph_s = rep[1:33]
+    tag_s = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub + nonce,
+                     hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag_s, rep[33:49]):
+        raise ValueError("bad reply tag")
+    sk = fs_key(x25519(eph_priv, eph_s))
+    upstream.settimeout(None)
+    return upstream, sk
 
 
 def relay_tcp(app, atyp, addr, port):
     upstream = None
     try:
-        magic = os.urandom(4)
-        nonce = os.urandom(16)
-        eph_priv = os.urandom(32)
-        eph_pub = x25519_pub(eph_priv)
-        tag = hmac.new(PSK, bytes((VERSION,)) + magic + nonce + eph_pub,
-                       hashlib.sha256).digest()[:16]
-        upstream = socket.create_connection((SERVER, SPORT), timeout=10)
-        upstream.settimeout(15)
-        upstream.sendall(bytes((VERSION,)) + magic + nonce + eph_pub + tag)
-        rep = recvn(upstream, 49)
-        if rep[0] != VERSION:
-            return
-        eph_s = rep[1:33]
-        tag_s = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub + nonce,
-                         hashlib.sha256).digest()[:16]
-        if not hmac.compare_digest(tag_s, rep[33:49]):
-            return
-        sk = fs_key(x25519(eph_priv, eph_s))
-        upstream.settimeout(None)
-        upstream.sendall(seal_cell(sk, os.urandom(12), bytes((atyp,)) + addr + port))
+        upstream, sk = tcp_handshake(atyp, addr, port)
         app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-
-        def down():
-            try:
-                while True:
-                    yield open_cell(sk, recvn(upstream, CELL))
-            except (OSError, EOFError, ValueError):
-                pass
 
         def pump_down():
             try:
-                for chunk in down():
-                    app.sendall(chunk)
-            except OSError:
+                while True:
+                    app.sendall(read_record(upstream, sk))
+            except (OSError, EOFError, ValueError):
                 pass
 
         t = threading.Thread(target=pump_down, daemon=True)
         t.start()
         try:
             while True:
-                data = app.recv(CELL_DATA)
+                data = app.recv(1388)
                 if not data:
                     break
-                upstream.sendall(seal_cell(sk, os.urandom(12), data))
+                off = 0
+                while off < len(data):
+                    total = _pick_class(TCP_CLASSES)
+                    budget = total - 2 - 12 - 16
+                    end = min(off + budget - 2, len(data))
+                    upstream.sendall(seal_record(sk, data[off:end], total))
+                    off = end
         except OSError:
             pass
-    except (OSError, EOFError):
+    except (OSError, EOFError, ValueError):
         pass
     finally:
         try:
@@ -346,8 +360,80 @@ def relay_tcp(app, atyp, addr, port):
                 pass
 
 
+def seal_dgram(sk, sid, rnonce, flags, seq, data, total):
+    budget = total - 25 - 16
+    data = data[:budget - 2]
+    pt = struct.pack(">H", len(data)) + data + os.urandom(budget - 2 - len(data))
+    ad = sid + bytes((flags,)) + struct.pack(">I", seq)
+    ct = aead_seal(sk, rnonce, pt, ad)
+    return sid + rnonce + bytes((flags,)) + struct.pack(">I", seq) + ct
+
+
+def parse_dgram(sk, sid, dg):
+    if not _valid_class(UDP_CLASSES, len(dg)) or dg[:8] != sid:
+        return None
+    try:
+        pt = aead_open(sk, dg[8:20], dg[25:], dg[:8] + dg[20:21] + dg[21:25])
+    except ValueError:
+        return None
+    budget = len(dg) - 25 - 16
+    ln = struct.unpack(">H", pt[:2])[0]
+    if ln > budget - 2:
+        return None
+    return struct.unpack(">I", dg[21:25])[0], pt[2:2 + ln]
+
+
+def _valid_class(classes, total):
+    return total in classes
+
+
+def udp_handshake(atyp, addr, port):
+    """Blocking hello + reply wait. Returns (us, sk, sid) or raises."""
+    us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    us.settimeout(30)
+    us.connect((SERVER, SPORT))
+    magic = os.urandom(4)
+    hs_nonce = os.urandom(16)
+    eph_priv = os.urandom(32)
+    eph_pub = x25519_pub(eph_priv)
+    tag = hmac.new(PSK, bytes((VERSION,)) + magic + hs_nonce + eph_pub,
+                   hashlib.sha256).digest()[:16]
+    sk0 = hs_key(hs_nonce)
+    sid = os.urandom(8)
+    target = bytes((atyp,)) + addr + port
+    total = _pick_class(UDP_CLASSES)
+    budget = total - 82 - 16
+    hpt = target + os.urandom(budget - len(target))
+    had = sid + b"\x01" + struct.pack(">I", 0)
+    hct = aead_seal(sk0, hs_nonce[:12], hpt, had)
+    hello = (bytes((VERSION,)) + magic + hs_nonce + eph_pub + tag + sid
+             + struct.pack(">I", 0) + b"\x01" + hct)
+    start = time.monotonic()
+    us.settimeout(1)
+    while time.monotonic() - start < 8:
+        try:
+            us.sendall(hello)
+        except OSError:
+            raise ValueError("send failed")
+        try:
+            dg, _ = us.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if not _valid_class(UDP_CLASSES, len(dg)) or dg[:8] != sid:
+            continue
+        eph_s, tag_s = dg[8:40], dg[40:56]
+        want = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub
+                        + hs_nonce + sid, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(want, tag_s):
+            continue
+        sk = fs_key(x25519(eph_priv, eph_s))
+        us.settimeout(30)
+        return us, sk, sid
+    raise ValueError("no hello reply")
+
+
 def udp_leg(app, atyp, addr, port):
-    """Relay one SOCKS connection over fixed-size AEAD UDP datagrams."""
+    """Pinned UDP with true 0-RTT: sender starts under sk0 immediately."""
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         us.settimeout(30)
@@ -365,23 +451,15 @@ def udp_leg(app, atyp, addr, port):
     sid = os.urandom(8)
     target = bytes((atyp,)) + addr + port
     dead = threading.Event()
-    sk_box = {}
+    keys = {"sk": sk0, "early": True}
 
-    def first_datagram():
-        pt = target + os.urandom(FIRST_PT - len(target))
-        ad = sid + b"\x01" + struct.pack(">I", 0)
-        ct = aead_seal(sk0, hs_nonce[:12], pt, ad)
-        return (bytes((VERSION,)) + magic + hs_nonce + eph_pub + tag + sid
-                + struct.pack(">I", 0) + b"\x01" + ct)
-
-    def data_datagram(seq, data):
-        sk = sk_box["sk"]
-        data = data[:DGRAM_DATA]
-        pt = struct.pack(">H", len(data)) + data + os.urandom(DGRAM_PT - 2 - len(data))
-        rnonce = os.urandom(12)
-        ad = sid + b"\x00" + struct.pack(">I", seq)
-        ct = aead_seal(sk, rnonce, pt, ad)
-        return sid + rnonce + b"\x00" + struct.pack(">I", seq) + ct
+    total = _pick_class(UDP_CLASSES)
+    budget = total - 82 - 16
+    hpt = target + os.urandom(budget - len(target))
+    had = sid + b"\x01" + struct.pack(">I", 0)
+    hct = aead_seal(sk0, hs_nonce[:12], hpt, had)
+    hello = (bytes((VERSION,)) + magic + hs_nonce + eph_pub + tag + sid
+             + struct.pack(">I", 0) + b"\x01" + hct)
 
     def sender():
         seq = 0
@@ -393,56 +471,240 @@ def udp_leg(app, atyp, addr, port):
                     break
                 if not data:
                     break
-                us.sendall(data_datagram(seq, data))
-                seq += 1
+                sk, early = keys["sk"], keys["early"]
+                fl = 0x02 if early else 0x00
+                off = 0
+                while off < len(data):
+                    t2 = _pick_class(UDP_CLASSES)
+                    b2 = t2 - 25 - 16
+                    end = min(off + b2 - 2, len(data))
+                    us.sendall(seal_dgram(sk, sid, os.urandom(12), fl, seq,
+                                          data[off:end], t2))
+                    seq += 1
+                    off = end
         finally:
             dead.set()
 
-    def parse_reply(dg, sk):
-        if len(dg) != DGRAM or dg[:8] != sid:
-            return None
-        rnonce, flags = dg[8:20], dg[20:21]
-        seq = struct.unpack(">I", dg[21:25])[0]
-        try:
-            pt = aead_open(sk, rnonce, dg[25:], dg[:8] + flags + dg[21:25])
-        except ValueError:
-            return None
-        ln = struct.unpack(">H", pt[:2])[0]
-        if ln > DGRAM_DATA:
-            return None
-        return seq, pt[2:2 + ln]
+    def parse_both(dg):
+        # try FS key first, always fall back to hello key: replies race
+        # the flip on fast paths (server may still answer under sk0).
+        sk = keys["sk"]
+        r = parse_dgram(sk, sid, dg)
+        if r is None:
+            r = parse_dgram(sk0, sid, dg)
+        return r
 
     try:
-        # hello + wait for server reply (retransmit hello, fresh session if needed)
-        sk = None
-        start = time.monotonic()
-        us.settimeout(1)
-        hello = first_datagram()
-        while time.monotonic() - start < 8:
-            try:
-                us.sendall(hello)
-            except OSError:
-                return
-            try:
-                dg, _ = us.recvfrom(2048)
-            except socket.timeout:
-                continue
-            if len(dg) != DGRAM or dg[:8] != sid:
-                continue
-            eph_s, tag_s = dg[8:40], dg[40:56]
-            want = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub
-                            + hs_nonce + sid, hashlib.sha256).digest()[:16]
-            if not hmac.compare_digest(want, tag_s):
-                continue
-            sk = fs_key(x25519(eph_priv, eph_s))
-            break
-        if sk is None:
-            return
-        sk_box["sk"] = sk
-        us.settimeout(30)
+        us.sendall(hello)
         app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         t = threading.Thread(target=sender, daemon=True)
         t.start()
+        expect = 0
+        pending = {}
+        gap_since = None
+        # hello retransmit + reply wait (runs alongside sender/receiver)
+        start = time.monotonic()
+        us.settimeout(1)
+        reply_ok = False
+        while time.monotonic() - start < 8 and not reply_ok:
+            try:
+                dg, _ = us.recvfrom(2048)
+            except socket.timeout:
+                try:
+                    us.sendall(hello)
+                except OSError:
+                    return
+                continue
+            if not _valid_class(UDP_CLASSES, len(dg)) or dg[:8] != sid:
+                continue
+            # reply or early data?
+            eph_s, tag_s = dg[8:40], dg[40:56]
+            want = hmac.new(PSK, bytes((VERSION,)) + eph_s + eph_pub
+                            + hs_nonce + sid, hashlib.sha256).digest()[:16]
+            if len(dg) >= 56 and hmac.compare_digest(want, tag_s):
+                keys["sk"] = fs_key(x25519(eph_priv, eph_s))
+                keys["early"] = False
+                reply_ok = True
+                continue
+            parsed = parse_both(dg)
+            if parsed is None:
+                continue
+            seq, data = parsed
+            if seq < expect or seq in pending:
+                continue
+            if len(pending) < UDP_REORDER_MAX:
+                pending[seq] = data
+            drained = False
+            while expect in pending:
+                try:
+                    app.sendall(pending.pop(expect))
+                except OSError:
+                    dead.set()
+                    break
+                expect += 1
+                drained = True
+            if drained:
+                gap_since = None
+            elif pending:
+                if gap_since is None:
+                    gap_since = time.monotonic()
+                elif time.monotonic() - gap_since > UDP_GAP_WAIT:
+                    expect = min(pending)
+                    gap_since = None
+        if not reply_ok:
+            return
+        us.settimeout(30)
+        while not dead.is_set():
+            try:
+                dg, _ = us.recvfrom(2048)
+            except socket.timeout:
+                break
+            parsed = parse_both(dg)
+            if parsed is None:
+                continue
+            seq, data = parsed
+            if seq < expect or seq in pending:
+                continue
+            if len(pending) < UDP_REORDER_MAX:
+                pending[seq] = data
+            drained = False
+            while expect in pending:
+                try:
+                    app.sendall(pending.pop(expect))
+                except OSError:
+                    dead.set()
+                    break
+                expect += 1
+                drained = True
+            if drained:
+                gap_since = None
+            elif pending:
+                if gap_since is None:
+                    gap_since = time.monotonic()
+                elif time.monotonic() - gap_since > UDP_GAP_WAIT:
+                    expect = min(pending)
+                    gap_since = None
+    finally:
+        dead.set()
+        try:
+            us.close()
+        except OSError:
+            pass
+
+
+def race_legs(atyp, addr, port):
+    """Run TCP + UDP handshakes concurrently; first verified win.
+    Returns ("tcp", upstream, sk, None) or ("udp", us, sk, sid)."""
+    out = {}
+    lock = threading.Lock()
+
+    def tcp_try():
+        try:
+            upstream, sk = tcp_handshake(atyp, addr, port)
+            with lock:
+                if "win" not in out:
+                    out["win"] = ("tcp", upstream, sk, None)
+                    return
+            try:
+                upstream.close()
+            except OSError:
+                pass
+        except (OSError, EOFError, ValueError):
+            pass
+
+    def udp_try():
+        try:
+            us, sk, sid = udp_handshake(atyp, addr, port)
+            with lock:
+                if "win" not in out:
+                    out["win"] = ("udp", us, sk, sid)
+                    return
+            try:
+                us.close()
+            except OSError:
+                pass
+        except (OSError, EOFError, ValueError):
+            pass
+
+    threading.Thread(target=tcp_try, daemon=True).start()
+    threading.Thread(target=udp_try, daemon=True).start()
+    start = time.monotonic()
+    while time.monotonic() - start < 12:
+        with lock:
+            if "win" in out:
+                return out["win"]
+        time.sleep(0.02)
+    return None
+
+
+def relay_tcp_conn(app, upstream, sk):
+    def pump_down():
+        try:
+            while True:
+                app.sendall(read_record(upstream, sk))
+        except (OSError, EOFError, ValueError):
+            pass
+
+    t = threading.Thread(target=pump_down, daemon=True)
+    t.start()
+    try:
+        while True:
+            data = app.recv(1388)
+            if not data:
+                break
+            off = 0
+            while off < len(data):
+                total = _pick_class(TCP_CLASSES)
+                budget = total - 2 - 12 - 16
+                end = min(off + budget - 2, len(data))
+                upstream.sendall(seal_record(sk, data[off:end], total))
+                off = end
+    except OSError:
+        pass
+
+
+def relay_udp_conn(app, us, sk, sid):
+    dead = threading.Event()
+
+    def sender():
+        seq = 0
+        try:
+            while not dead.is_set():
+                try:
+                    data = app.recv(UDP_CHUNK)
+                except OSError:
+                    break
+                if not data:
+                    break
+                off = 0
+                while off < len(data):
+                    total = _pick_class(UDP_CLASSES)
+                    budget = total - 25 - 16
+                    end = min(off + budget - 2, len(data))
+                    us.sendall(seal_dgram(sk, sid, os.urandom(12), 0, seq,
+                                          data[off:end], total))
+                    seq += 1
+                    off = end
+        finally:
+            dead.set()
+
+    def parse_one(dg):
+        if not _valid_class(UDP_CLASSES, len(dg)) or dg[:8] != sid:
+            return None
+        try:
+            pt = aead_open(sk, dg[8:20], dg[25:], dg[:8] + dg[20:21] + dg[21:25])
+        except ValueError:
+            return None
+        budget = len(dg) - 25 - 16
+        ln = struct.unpack(">H", pt[:2])[0]
+        if ln > budget - 2:
+            return None
+        return struct.unpack(">I", dg[21:25])[0], pt[2:2 + ln]
+
+    try:
+        t = threading.Thread(target=sender, daemon=True)
+        t.start()
+        us.settimeout(30)
         expect = 0
         pending = {}
         gap_since = None
@@ -451,7 +713,7 @@ def udp_leg(app, atyp, addr, port):
                 dg, _ = us.recvfrom(2048)
             except socket.timeout:
                 break
-            parsed = parse_reply(dg, sk)
+            parsed = parse_one(dg)
             if parsed is None:
                 continue
             seq, data = parsed
@@ -513,6 +775,20 @@ def handle(app):
         port = recvn(app, 2)
         if TRANSPORT == "udp":
             udp_leg(app, atyp, addr, port)
+            return
+        if TRANSPORT == "auto":
+            w = race_legs(atyp, addr, port)
+            if w is None:
+                try:
+                    app.close()
+                except OSError:
+                    pass
+                return
+            app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            if w[0] == "tcp":
+                relay_tcp_conn(app, w[1], w[2])
+            else:
+                relay_udp_conn(app, w[1], w[2], w[3])
             return
         relay_tcp(app, atyp, addr, port)
     except (OSError, EOFError):

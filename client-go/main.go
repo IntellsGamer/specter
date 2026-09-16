@@ -1,7 +1,8 @@
 package main
 
-// Specter v3 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
-// Config: config.json (server/port/psk/transport) or argv path. Env overrides.
+// Specter v3.1 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+// Config: config.json (server/port/psk/transport tcp|udp|auto) or argv path.
+// Env overrides: SPECTER_SERVER/PORT/PSK/TRANSPORT.
 
 import (
 	"crypto/hmac"
@@ -17,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -25,19 +27,29 @@ import (
 )
 
 const (
-	version     = 0x02
-	cellSize    = 1024
-	cellPT      = 996
-	cellData    = 994
-	dgramSize   = 1280
-	dgramPT     = 1239
-	dgramData   = 1237
-	firstPT     = 1182
-	udpChunk    = 1200
-	udpReorder  = 64
-	udpGapWait  = 300 * time.Millisecond
+	version     = 0x03
 	socksListen = "127.0.0.1:10867"
 )
+
+var tcpClasses = []int{320, 576, 1024, 1420}
+var udpClasses = []int{576, 1024, 1280}
+
+func pickClass(classes []int) int {
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return classes[len(classes)-1]
+	}
+	return classes[int(b[0])%len(classes)]
+}
+
+func validClass(classes []int, total int) bool {
+	for _, c := range classes {
+		if c == total {
+			return true
+		}
+	}
+	return false
+}
 
 type Config struct {
 	Server    string `json:"server"`
@@ -70,19 +82,21 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 	if v := os.Getenv("SPECTER_TRANSPORT"); v != "" {
 		cfg.Transport = v
 	}
+	if cfg.Transport == "" {
+		cfg.Transport = "auto"
+	}
+	if cfg.Transport != "tcp" && cfg.Transport != "udp" && cfg.Transport != "auto" {
+		log.Fatal(`transport must be "tcp", "udp" or "auto"`)
+	}
 	missing := cfg.Server == "" || cfg.Server == "YOUR_SERVER_IP" ||
 		cfg.Psk == "" || (len(cfg.Psk) >= 7 && cfg.Psk[:7] == "REPLACE")
 	if missing {
-		// first run: drop a dummy config next to the binary so the user
-		// has something to fill in, then explain via GUI if present.
-		// Never overwrite an existing file.
 		if cfgPath != "" {
 			if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 				dummy, _ := json.MarshalIndent(Config{
-					Server:    "203.0.113.10",
-					Port:      43117,
+					Server: "203.0.113.10", Port: 43117,
 					Psk:       "REPLACE_WITH_64_HEX_CHARS_FROM_SERVER",
-					Transport: "tcp",
+					Transport: "auto",
 				}, "", "  ")
 				_ = os.WriteFile(cfgPath, append(dummy, '\n'), 0600)
 			}
@@ -94,14 +108,7 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 	if cfg.Port == 0 {
 		cfg.Port = 43117
 	}
-	if cfg.Transport == "" {
-		cfg.Transport = "tcp"
-	}
-	if cfg.Transport != "tcp" && cfg.Transport != "udp" {
-		log.Fatal(`transport must be "tcp" or "udp"`)
-	}
-	raw := cfg.Psk
-	b, err := hex.DecodeString(raw)
+	b, err := hex.DecodeString(cfg.Psk)
 	if err != nil || len(b) != 32 {
 		log.Fatal("psk must be 64 hex chars")
 	}
@@ -115,6 +122,14 @@ func fsKey(psk, shared []byte) []byte {
 		panic(err)
 	}
 	return out
+}
+
+func hsKey(psk, hsNonce []byte) []byte {
+	h := sha256.New()
+	h.Write(psk)
+	h.Write([]byte("specter-v3-hs"))
+	h.Write(hsNonce)
+	return h.Sum(nil)
 }
 
 func genEphemeral() (priv, pub []byte) {
@@ -135,27 +150,70 @@ func randBytes(n int) []byte {
 	return b
 }
 
-// ---------- TCP ----------
+// ---------- TCP records ----------
 
-func sealCell(sk, rnonce, data []byte) []byte {
-	if len(data) > cellData {
-		data = data[:cellData]
+func sealRecord(sk, data []byte, total int) []byte {
+	budget := total - 2 - 12 - 16
+	if len(data) > budget-2 {
+		data = data[:budget-2]
 	}
-	pt := make([]byte, cellPT)
+	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
 	copy(pt[2:], data)
 	if _, err := rand.Read(pt[2+len(data):]); err != nil {
 		panic(err)
 	}
 	a, _ := chacha20poly1305.New(sk)
-	out := make([]byte, 0, cellSize)
+	rnonce := randBytes(12)
+	out := make([]byte, 0, total)
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(total-2))
+	out = append(out, hdr[:]...)
 	out = append(out, rnonce...)
 	out = append(out, a.Seal(nil, rnonce, pt, nil)...)
 	return out
 }
 
-func tcpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, portb []byte) {
-	defer app.Close()
+func readRecord(r io.Reader, sk []byte) ([]byte, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	total := int(binary.BigEndian.Uint16(hdr[:])) + 2
+	if !validClass(tcpClasses, total) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	body := make([]byte, total-2)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	a, _ := chacha20poly1305.New(sk)
+	pt, err := a.Open(nil, body[:12], body[12:], nil)
+	if err != nil {
+		return nil, err
+	}
+	ln := int(binary.BigEndian.Uint16(pt[:2]))
+	budget := total - 2 - 12 - 16
+	if ln < 0 || 2+ln > budget || 2+ln > len(pt) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return pt[2 : 2+ln], nil
+}
+
+// ---------- established sessions ----------
+
+type established struct {
+	transport string
+	up        net.Conn  // tcp
+	us        *net.UDPConn // udp
+	sk        []byte
+	sid       []byte // udp
+	sk0       []byte // udp hello key (kept for completeness)
+}
+
+// handshakeTCP performs hs + first record (target, sk0) in one flight,
+// verifies the reply, and returns a live session.
+func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []byte) (*established, error) {
 	magic := randBytes(4)
 	nonce := randBytes(16)
 	ephPriv, ephPub := genEphemeral()
@@ -165,27 +223,33 @@ func tcpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	m.Write(nonce)
 	m.Write(ephPub)
 	tag := m.Sum(nil)[:16]
+	sk0 := hsKey(psk, nonce)
 	up, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
 	if err != nil {
-		return
+		return nil, err
 	}
-	defer up.Close()
 	hs := make([]byte, 0, 69)
 	hs = append(hs, version)
 	hs = append(hs, magic...)
 	hs = append(hs, nonce...)
 	hs = append(hs, ephPub...)
 	hs = append(hs, tag...)
+	tgt := append([]byte{atyp}, addr...)
+	tgt = append(tgt, portb...)
+	flight := append(hs, sealRecord(sk0, tgt, pickClass(tcpClasses))...)
 	up.SetDeadline(time.Now().Add(15 * time.Second))
-	if _, err := up.Write(hs); err != nil {
-		return
+	if _, err := up.Write(flight); err != nil {
+		up.Close()
+		return nil, err
 	}
 	rep := make([]byte, 49)
 	if _, err := io.ReadFull(up, rep); err != nil {
-		return
+		up.Close()
+		return nil, err
 	}
 	if rep[0] != version {
-		return
+		up.Close()
+		return nil, fmt.Errorf("bad version")
 	}
 	ephS := rep[1:33]
 	m2 := hmac.New(sha256.New, psk)
@@ -194,65 +258,65 @@ func tcpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	m2.Write(ephPub)
 	m2.Write(nonce)
 	if !hmac.Equal(m2.Sum(nil)[:16], rep[33:49]) {
-		return
+		up.Close()
+		return nil, fmt.Errorf("bad reply tag")
 	}
 	shared, err := curve25519.X25519(ephPriv, ephS)
 	if err != nil {
-		return
+		up.Close()
+		return nil, err
 	}
-	sk := fsKey(psk, shared)
-	tgt := append([]byte{atyp}, addr...)
-	tgt = append(tgt, portb...)
-	if _, err := up.Write(sealCell(sk, randBytes(12), tgt)); err != nil {
-		return
-	}
-	if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
-		return
-	}
+	return &established{transport: "tcp", up: up, sk: fsKey(psk, shared)}, nil
+}
+
+func relayTCP(app net.Conn, e *established) {
+	defer app.Close()
+	defer e.up.Close()
 	done := make(chan struct{}, 2)
 	go func() {
 		defer func() { done <- struct{}{} }()
-		cell := make([]byte, cellSize)
-		a, _ := chacha20poly1305.New(sk)
 		for {
-			if _, err := io.ReadFull(up, cell); err != nil {
-				return
-			}
-			pt, err := a.Open(nil, cell[:12], cell[12:], nil)
+			d, err := readRecord(e.up, e.sk)
 			if err != nil {
 				return
 			}
-			ln := int(binary.BigEndian.Uint16(pt[:2]))
-			if ln > cellData {
-				return
-			}
+			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
-			if _, err := app.Write(pt[2 : 2+ln]); err != nil {
+			if _, err := app.Write(d); err != nil {
 				return
 			}
 		}
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, cellData)
+		buf := make([]byte, 1388)
 		for {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
 			if err != nil || n == 0 {
 				return
 			}
-			up.SetDeadline(time.Now().Add(3 * time.Minute))
-			if _, err := up.Write(sealCell(sk, randBytes(12), buf[:n])); err != nil {
-				return
+			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
+			off := 0
+			for off < n {
+				total := pickClass(tcpClasses)
+				end := off + total - 2 - 12 - 16 - 2
+				if end > n {
+					end = n
+				}
+				if _, err := e.up.Write(sealRecord(e.sk, buf[off:end], total)); err != nil {
+					return
+				}
+				off = end
 			}
 		}
 	}()
 	<-done
 }
 
-// ---------- UDP ----------
-
-func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, budget int) []byte {
+// sealDgram builds a class-sized data datagram.
+func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, total int) []byte {
+	budget := total - 25 - 16
 	if len(data) > budget-2 {
 		data = data[:budget-2]
 	}
@@ -270,7 +334,7 @@ func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, budg
 	binary.BigEndian.PutUint32(b[:], seq)
 	ad = append(ad, b[:]...)
 	ct := a.Seal(nil, rnonce, pt, ad)
-	out := make([]byte, 0, len(sid)+12+1+4+len(ct))
+	out := make([]byte, 0, total)
 	out = append(out, sid...)
 	out = append(out, rnonce...)
 	out = append(out, flags)
@@ -279,13 +343,12 @@ func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, budg
 	return out
 }
 
-func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, portb []byte) {
-	defer app.Close()
+// handshakeUDP performs hello + reply wait (retransmitting) and returns live session.
+func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []byte) (*established, error) {
 	us, err := net.DialTimeout("udp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
 	if err != nil {
-		return
+		return nil, err
 	}
-	defer us.Close()
 	magic := randBytes(4)
 	hsNonce := randBytes(16)
 	ephPriv, ephPub := genEphemeral()
@@ -295,56 +358,52 @@ func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	m.Write(hsNonce)
 	m.Write(ephPub)
 	tag := m.Sum(nil)[:16]
-	sk0 := func() []byte {
-		h := sha256.New()
-		h.Write(psk)
-		h.Write([]byte("specter-v3-hs"))
-		h.Write(hsNonce)
-		return h.Sum(nil)
-	}()
+	sk0 := hsKey(psk, hsNonce)
 	sid := randBytes(8)
 	target := append([]byte{atyp}, addr...)
 	target = append(target, portb...)
-
-	// first datagram: ver+magic+hs+ephC+tag+sid+seq+flags+AEAD (fixed 1280)
-	fpt := make([]byte, firstPT)
-	copy(fpt, target)
-	if _, err := rand.Read(fpt[len(target):]); err != nil {
-		return
+	helloTotal := pickClass(udpClasses)
+	hbudget := helloTotal - 82 - 16
+	hpt := make([]byte, hbudget)
+	copy(hpt, target)
+	if _, err := rand.Read(hpt[len(target):]); err != nil {
+		us.Close()
+		return nil, err
 	}
 	a, _ := chacha20poly1305.New(sk0)
 	fad := make([]byte, 0, 13)
 	fad = append(fad, sid...)
 	fad = append(fad, 1)
 	fad = append(fad, 0, 0, 0, 0)
-	fct := a.Seal(nil, hsNonce[:12], fpt, fad)
-	first := make([]byte, 0, dgramSize)
-	first = append(first, version)
-	first = append(first, magic...)
-	first = append(first, hsNonce...)
-	first = append(first, ephPub...)
-	first = append(first, tag...)
-	first = append(first, sid...)
-	first = append(first, 0, 0, 0, 0, 1)
-	first = append(first, fct...)
-	var sk []byte
+	fct := a.Seal(nil, hsNonce[:12], hpt, fad)
+	hello := make([]byte, 0, helloTotal)
+	hello = append(hello, version)
+	hello = append(hello, magic...)
+	hello = append(hello, hsNonce...)
+	hello = append(hello, ephPub...)
+	hello = append(hello, tag...)
+	hello = append(hello, sid...)
+	hello = append(hello, 0, 0, 0, 0, 1)
+	hello = append(hello, fct...)
 	deadline := time.Now().Add(8 * time.Second)
 	for {
 		us.SetDeadline(time.Now().Add(time.Second))
-		if _, err := us.Write(first); err != nil {
-			return
+		if _, err := us.Write(hello); err != nil {
+			us.Close()
+			return nil, err
 		}
-		rep := make([]byte, dgramSize)
+		rep := make([]byte, 2048)
 		us.SetDeadline(time.Now().Add(time.Second))
 		n, err := us.Read(rep)
 		if err != nil {
 			if time.Now().After(deadline) {
-				return
+				us.Close()
+				return nil, fmt.Errorf("no hello reply")
 			}
 			continue
 		}
 		rep = rep[:n]
-		if len(rep) != dgramSize || string(rep[:8]) != string(sid) {
+		if !validClass(udpClasses, len(rep)) || string(rep[:8]) != string(sid) {
 			continue
 		}
 		ephS := rep[8:40]
@@ -359,65 +418,88 @@ func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 		}
 		shared, err := curve25519.X25519(ephPriv, ephS)
 		if err != nil {
-			return
+			us.Close()
+			return nil, err
 		}
-		sk = fsKey(psk, shared)
-		break
+		sk := fsKey(psk, shared)
+		// sender starts immediately from here; early data handled by caller via sk0
+		return &established{transport: "udp", us: us.(*net.UDPConn), sk: sk, sid: sid, sk0: sk0}, nil
 	}
-	if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
-		return
-	}
+}
+
+func relayUDP(app net.Conn, e *established) {
+	defer app.Close()
+	defer e.us.Close()
+	sk := e.sk
+	sid := e.sid
+	// reply already verified during handshake, so sk is live.
 	done := make(chan struct{})
-	// sender
 	go func() {
 		defer close(done)
 		var seq uint32
-		buf := make([]byte, udpChunk)
+		buf := make([]byte, 1200)
 		for {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
 			if err != nil || n == 0 {
 				return
 			}
-			dg := sealDgram(sk, sid, randBytes(12), 0, seq, buf[:n], dgramPT)
-			seq++
-			us.SetDeadline(time.Now().Add(30 * time.Second))
-			if _, err := us.Write(dg); err != nil {
-				return
+			total := pickClass(udpClasses)
+			budget := total - 25 - 16
+			off := 0
+			for off < n {
+				end := off + budget - 2
+				if end > n {
+					end = n
+				}
+				dg := sealDgram(sk, sid, randBytes(12), 0, seq, buf[off:end], total)
+				seq++
+				e.us.SetDeadline(time.Now().Add(30 * time.Second))
+				if _, err := e.us.Write(dg); err != nil {
+					return
+				}
+				off = end
 			}
 		}
 	}()
-	// receiver with reorder
-	defer func() { <-done }()
 	expect := uint32(0)
 	pending := map[uint32][]byte{}
 	var gapSince time.Time
 	rbuf := make([]byte, 2048)
-	a2, _ := chacha20poly1305.New(sk)
+	a, _ := chacha20poly1305.New(sk)
 	for {
-		us.SetDeadline(time.Now().Add(3 * time.Minute))
-		n, err := us.Read(rbuf)
+		select {
+		case <-done:
+			return
+		default:
+		}
+		e.us.SetDeadline(time.Now().Add(3 * time.Minute))
+		n, err := e.us.Read(rbuf)
 		if err != nil {
 			return
 		}
 		dg := rbuf[:n]
-		if len(dg) != dgramSize || string(dg[:8]) != string(sid) {
+		if !validClass(udpClasses, len(dg)) || string(dg[:8]) != string(sid) {
 			continue
 		}
-		pt, err := a2.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
+		pt, err := a.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
 		if err != nil {
 			continue
 		}
 		seq := binary.BigEndian.Uint32(dg[21:25])
 		ln := int(binary.BigEndian.Uint16(pt[:2]))
-		if ln > dgramData || 2+ln > len(pt) {
+		budget := len(dg) - 25 - 16
+		if ln < 0 || 2+ln > budget || 2+ln > len(pt) {
 			continue
 		}
 		data := append([]byte(nil), pt[2:2+ln]...)
-		if seq < expect || pendingHas(pending, seq) {
+		if seq < expect {
 			continue
 		}
-		if len(pending) < udpReorder {
+		if _, dup := pending[seq]; dup {
+			continue
+		}
+		if len(pending) < 64 {
 			pending[seq] = data
 		}
 		drained := false
@@ -439,7 +521,7 @@ func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 		} else if len(pending) > 0 {
 			if gapSince.IsZero() {
 				gapSince = time.Now()
-			} else if time.Since(gapSince) > udpGapWait {
+			} else if time.Since(gapSince) > 300*time.Millisecond {
 				min := seq
 				for k := range pending {
 					if k < min {
@@ -453,9 +535,280 @@ func udpLeg(app net.Conn, server string, port int, psk []byte, atyp byte, addr, 
 	}
 }
 
-func pendingHas(m map[uint32][]byte, k uint32) bool {
-	_, ok := m[k]
-	return ok
+// udpLegPinned runs UDP with true 0-RTT: sender starts under sk0
+// immediately, flips to sk once the hello reply verifies.
+func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, addr, portb []byte) {
+	defer app.Close()
+	us, err := net.DialTimeout("udp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer us.Close()
+	magic := randBytes(4)
+	hsNonce := randBytes(16)
+	ephPriv, ephPub := genEphemeral()
+	m := hmac.New(sha256.New, psk)
+	m.Write([]byte{version})
+	m.Write(magic)
+	m.Write(hsNonce)
+	m.Write(ephPub)
+	tag := m.Sum(nil)[:16]
+	sk0 := hsKey(psk, hsNonce)
+	sid := randBytes(8)
+	target := append([]byte{atyp}, addr...)
+	target = append(target, portb...)
+	total := pickClass(udpClasses)
+	budget := total - 82 - 16
+	hpt := make([]byte, budget)
+	copy(hpt, target)
+	if _, err := rand.Read(hpt[len(target):]); err != nil {
+		return
+	}
+	a0, _ := chacha20poly1305.New(sk0)
+	fad := append(append(append([]byte(nil), sid...), 1), 0, 0, 0, 0)
+	fct := a0.Seal(nil, hsNonce[:12], hpt, fad)
+	hello := make([]byte, 0, total)
+	hello = append(hello, version)
+	hello = append(hello, magic...)
+	hello = append(hello, hsNonce...)
+	hello = append(hello, ephPub...)
+	hello = append(hello, tag...)
+	hello = append(hello, sid...)
+	hello = append(hello, 0, 0, 0, 0, 1)
+	hello = append(hello, fct...)
+	type keyState struct {
+		sync.Mutex
+		sk    []byte
+		early bool
+	}
+	ks := &keyState{sk: sk0, early: true}
+	if _, err := us.Write(hello); err != nil {
+		return
+	}
+	// hello retransmit until reply (or give up with sender running)
+	replyDone := make(chan struct{})
+	go func() {
+		defer close(replyDone)
+		deadline := time.Now().Add(8 * time.Second)
+		rep := make([]byte, 2048)
+		for {
+			us.SetDeadline(time.Now().Add(time.Second))
+			if _, err := us.Write(hello); err != nil {
+				return
+			}
+			us.SetDeadline(time.Now().Add(time.Second))
+			n, err := us.Read(rep)
+			if err != nil {
+				if time.Now().After(deadline) {
+					return
+				}
+				continue
+			}
+			// data datagram (server fast path)? stash check: must be reply-sized with tag
+			r := rep[:n]
+			if !validClass(udpClasses, len(r)) || string(r[:8]) != string(sid) {
+				continue
+			}
+			ephS := r[8:40]
+			m2 := hmac.New(sha256.New, psk)
+			m2.Write([]byte{version})
+			m2.Write(ephS)
+			m2.Write(ephPub)
+			m2.Write(hsNonce)
+			m2.Write(sid)
+			if !hmac.Equal(m2.Sum(nil)[:16], r[40:56]) {
+				continue
+			}
+			shared, err := curve25519.X25519(ephPriv, ephS)
+			if err != nil {
+				return
+			}
+			ks.Lock()
+			ks.sk = fsKey(psk, shared)
+			ks.early = false
+			ks.Unlock()
+			return
+		}
+	}()
+	if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var seq uint32
+		buf := make([]byte, 1200)
+		for {
+			app.SetDeadline(time.Now().Add(3 * time.Minute))
+			n, err := app.Read(buf)
+			if err != nil || n == 0 {
+				return
+			}
+			off := 0
+			for off < n {
+				total := pickClass(udpClasses)
+				budget := total - 25 - 16
+				end := off + budget - 2
+				if end > n {
+					end = n
+				}
+				ks.Lock()
+				kk, early := ks.sk, ks.early
+				ks.Unlock()
+				var fl byte
+				if early {
+					fl = 2
+				}
+				dg := sealDgram(kk, sid, randBytes(12), fl, seq, buf[off:end], total)
+				seq++
+				us.SetDeadline(time.Now().Add(30 * time.Second))
+				if _, err := us.Write(dg); err != nil {
+					return
+				}
+				off = end
+			}
+		}
+	}()
+	expect := uint32(0)
+	pending := map[uint32][]byte{}
+	var gapSince time.Time
+	rbuf := make([]byte, 2048)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		us.SetDeadline(time.Now().Add(3 * time.Minute))
+		n, err := us.Read(rbuf)
+		if err != nil {
+			return
+		}
+		dg := rbuf[:n]
+		if !validClass(udpClasses, len(dg)) || string(dg[:8]) != string(sid) {
+			continue
+		}
+		ks.Lock()
+		kk := ks.sk
+		ks.Unlock()
+		a, _ := chacha20poly1305.New(kk)
+		pt, err := a.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
+		if err != nil {
+			// replies race the key flip on fast paths; sk0 is equally
+			// authenticated, so always try it as fallback.
+			a0, _ := chacha20poly1305.New(sk0)
+			pt, err = a0.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
+		}
+		if err != nil {
+			continue
+		}
+		seq := binary.BigEndian.Uint32(dg[21:25])
+		ln := int(binary.BigEndian.Uint16(pt[:2]))
+		budget := len(dg) - 25 - 16
+		if ln < 0 || 2+ln > budget || 2+ln > len(pt) {
+			continue
+		}
+		data := append([]byte(nil), pt[2:2+ln]...)
+		if seq < expect {
+			continue
+		}
+		if _, dup := pending[seq]; !dup && len(pending) < 64 {
+			pending[seq] = data
+		}
+		drained := false
+		for {
+			d, ok := pending[expect]
+			if !ok {
+				break
+			}
+			delete(pending, expect)
+			app.SetDeadline(time.Now().Add(3 * time.Minute))
+			if _, err := app.Write(d); err != nil {
+				return
+			}
+			expect++
+			drained = true
+		}
+		if drained {
+			gapSince = time.Time{}
+		} else if len(pending) > 0 {
+			if gapSince.IsZero() {
+				gapSince = time.Now()
+			} else if time.Since(gapSince) > 300*time.Millisecond {
+				min := seq
+				for k := range pending {
+					if k < min {
+						min = k
+					}
+				}
+				expect = min
+				gapSince = time.Time{}
+			}
+		}
+	}
+}
+
+// raceLegs runs TCP and UDP handshakes concurrently; first verified win.
+func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte) *established {
+	type result struct {
+		es  *established
+		err error
+	}
+	tcpCh := make(chan result, 1)
+	udpCh := make(chan result, 1)
+	go func() {
+		es, err := handshakeTCP(server, port, psk, atyp, addr, portb)
+		tcpCh <- result{es, err}
+	}()
+	go func() {
+		es, err := handshakeUDP(server, port, psk, atyp, addr, portb)
+		udpCh <- result{es, err}
+	}()
+	timeout := time.After(12 * time.Second)
+	var tcpRes, udpRes *result
+	for tcpRes == nil || udpRes == nil {
+		select {
+		case r := <-tcpCh:
+			tcpRes = &r
+			if r.err == nil {
+				go func() {
+					u := <-udpCh
+					if u.err == nil && u.es != nil {
+						u.es.us.Close()
+					}
+					udpRes = &u
+				}()
+				return r.es
+			}
+		case r := <-udpCh:
+			udpRes = &r
+			if r.err == nil {
+				go func() {
+					t := <-tcpCh
+					if t.err == nil && t.es != nil {
+						t.es.up.Close()
+					}
+					tcpRes = &t
+				}()
+				return r.es
+			}
+		case <-timeout:
+			if tcpRes != nil && tcpRes.err == nil {
+				return tcpRes.es
+			}
+			if udpRes != nil && udpRes.err == nil {
+				return udpRes.es
+			}
+			return nil
+		}
+	}
+	if tcpRes != nil && tcpRes.err == nil {
+		return tcpRes.es
+	}
+	if udpRes != nil && udpRes.err == nil {
+		return udpRes.es
+	}
+	return nil
 }
 
 // ---------- SOCKS front ----------
@@ -503,12 +856,14 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	case 1:
 		addr, err = readN(app, 4)
 	case 3:
-		l, err2 := readN(app, 1)
-		if err2 != nil {
+		var l []byte
+		l, err = readN(app, 1)
+		if err != nil {
 			return
 		}
-		name, err2 := readN(app, int(l[0]))
-		if err2 != nil {
+		var name []byte
+		name, err = readN(app, int(l[0]))
+		if err != nil {
 			return
 		}
 		addr = append([]byte{l[0]}, name...)
@@ -524,11 +879,38 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	if err != nil {
 		return
 	}
-	if transport == "udp" {
-		udpLeg(app, server, port, psk, atyp, addr, portb)
-		return
+	switch transport {
+	case "tcp":
+		es, err := handshakeTCP(server, port, psk, atyp, addr, portb)
+		if err != nil {
+			return
+		}
+		if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+			es.up.Close()
+			return
+		}
+		relayTCP(app, es)
+	case "udp":
+		udpLegPinned(app, server, port, psk, atyp, addr, portb)
+	default: // auto: race, first verified reply wins
+		es := raceLegs(server, port, psk, atyp, addr, portb)
+		if es == nil {
+			return
+		}
+		if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+			if es.transport == "tcp" {
+				es.up.Close()
+			} else {
+				es.us.Close()
+			}
+			return
+		}
+		if es.transport == "tcp" {
+			relayTCP(app, es)
+		} else {
+			relayUDP(app, es)
+		}
 	}
-	tcpLeg(app, server, port, psk, atyp, addr, portb)
 }
 
 func main() {
@@ -537,7 +919,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("specter-go client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
+	log.Printf("specter-go v3.1 client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
+	_ = psk
 	for {
 		c, err := ln.Accept()
 		if err != nil {
