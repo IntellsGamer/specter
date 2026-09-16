@@ -47,18 +47,13 @@ def _load_config():
     if transport not in ("tcp", "udp"):
         raise SystemExit('Specter: transport must be "tcp" or "udp".')
     raw = os.environ.get("SPECTER_PSK") or cfg.get("psk", "")
-    if not server or server in ("YOUR_SERVER_IP", "REPLACE_ME"):
-        raise SystemExit(
-            "Specter: no server set. Copy client/config.example.json to\n"
-            "client/config.json and fill in server/port/psk — or set\n"
-            "SPECTER_SERVER / SPECTER_PORT / SPECTER_PSK env vars."
-        )
+    if (not server or server in ("YOUR_SERVER_IP", "REPLACE_ME")
+            or not raw or "REPLACE" in str(raw)):
+        _first_run(candidates)
     try:
         port = int(port)
     except (TypeError, ValueError):
         raise SystemExit("Specter: port must be a number.")
-    if not raw or "REPLACE" in str(raw):
-        raise SystemExit("Specter: no key set (config.json psk or SPECTER_PSK).")
     try:
         key = bytes.fromhex(str(raw).strip())
     except ValueError:
@@ -66,6 +61,53 @@ def _load_config():
     if len(key) != 32:
         raise SystemExit("Specter: psk must decode to exactly 32 bytes.")
     return server, port, key, transport
+
+
+def _notify(title, msg):
+    """GUI popup when a display exists, else stderr."""
+    import sys as _sys
+    try:
+        if os.name == "nt":
+            import ctypes as _ct
+            _ct.windll.user32.MessageBoxW(0, msg, title, 0x40)
+            return
+        if _sys.platform == "darwin":
+            import subprocess as _sp
+            _sp.run(["osascript", "-e",
+                     'display dialog "%s" with title "%s" buttons {"OK"}' % (msg, title)],
+                    timeout=30)
+            return
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            import shutil as _sh, subprocess as _sp
+            if _sh.which("zenity"):
+                _sp.run(["zenity", "--info", "--title=" + title, "--text=" + msg],
+                        timeout=30)
+                return
+    except Exception:
+        pass
+    print("%s: %s" % (title, msg))
+
+
+def _first_run(candidates):
+    """Write a dummy config.json (never overwrite) + explain, then exit."""
+    target = None
+    for path in candidates:
+        if path:
+            target = path
+            break
+    if target and not os.path.exists(target):
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump({"server": "203.0.113.10", "port": DEFAULT_PORT,
+                           "transport": "tcp",
+                           "psk": "REPLACE_WITH_64_HEX_CHARS_FROM_SERVER"}, f, indent=2)
+            os.chmod(target, 0o600)
+        except OSError:
+            target = None
+    msg = ("I wrote a dummy config.json%s — fill in server/port/psk "
+           "and run me again." % (" at " + target if target else ""))
+    _notify("Specter", msg)
+    raise SystemExit("Specter: " + msg)
 
 
 SERVER, SPORT, PSK, TRANSPORT = _load_config()

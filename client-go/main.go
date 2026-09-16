@@ -51,6 +51,7 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 		path = filepath.Join(filepath.Dir(exe), "config.json")
 	}
 	var cfg Config
+	cfgPath := path
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &cfg)
 	}
@@ -66,8 +67,26 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 	if v := os.Getenv("SPECTER_TRANSPORT"); v != "" {
 		cfg.Transport = v
 	}
-	if cfg.Server == "" || cfg.Server == "YOUR_SERVER_IP" {
-		log.Fatal("no server set (config.json or SPECTER_SERVER)")
+	missing := cfg.Server == "" || cfg.Server == "YOUR_SERVER_IP" ||
+		cfg.Psk == "" || (len(cfg.Psk) >= 7 && cfg.Psk[:7] == "REPLACE")
+	if missing {
+		// first run: drop a dummy config next to the binary so the user
+		// has something to fill in, then explain via GUI if present.
+		// Never overwrite an existing file.
+		if cfgPath != "" {
+			if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+				dummy, _ := json.MarshalIndent(Config{
+					Server:    "203.0.113.10",
+					Port:      43117,
+					Psk:       "REPLACE_WITH_64_HEX_CHARS_FROM_SERVER",
+					Transport: "tcp",
+				}, "", "  ")
+				_ = os.WriteFile(cfgPath, append(dummy, '\n'), 0600)
+			}
+		}
+		msg := "I wrote a dummy config.json next to the app — fill in server/port/psk and run me again."
+		notifyUser("Specter", msg)
+		log.Fatal("no server/key set — dummy config.json created, fill it in and rerun")
 	}
 	if cfg.Port == 0 {
 		cfg.Port = 43117
@@ -79,9 +98,6 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 		log.Fatal(`transport must be "tcp" or "udp"`)
 	}
 	raw := cfg.Psk
-	if raw == "" || len(raw) >= 7 && raw[:7] == "REPLACE" {
-		log.Fatal("no key set (config.json psk or SPECTER_PSK)")
-	}
 	b, err := hex.DecodeString(raw)
 	if err != nil || len(b) != 32 {
 		log.Fatal("psk must be 64 hex chars")

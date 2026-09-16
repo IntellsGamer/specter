@@ -1,8 +1,14 @@
 # Specter
 
-A tiny obfuscated TCP/UDP relay protocol: a Go server plus a Python SOCKS5 client.
-Point any SOCKS-capable app (v2ray, browsers, curl) at the local client and it
-rides to the server inside Specter's framing.
+A tiny obfuscated TCP/UDP relay protocol: a Go server plus Go and Python
+SOCKS5 clients. Point any SOCKS-capable app (v2ray, browsers, curl) at the
+local client and it rides to the server inside Specter's framing.
+
+**Downloads:** see [Releases](https://github.com/IntellsGamer/specter/releases)
+— `specter-client-*` for Windows/macOS/Linux, `specter-server-linux-*`.
+Run the client once and it writes a dummy `config.json` next to itself
+(with a popup when a display is present) — fill in your server details.
+
 
 > **Warning:** Specter is *obfuscation with authentication*, not audited
 > cryptography. Frames use ChaCha20-Poly1305 with per-connection keys, but
