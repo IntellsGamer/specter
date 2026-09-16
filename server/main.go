@@ -1,10 +1,11 @@
 package main
 
-// Specter server: toy obfuscated TCP relay. NOT audited crypto.
-// Configure with environment: SPECTER_PSK (hex, required), SPECTER_LISTEN (default ":43117").
+// Specter v2 server: AEAD cells, dynamic magic, replay cache. NOT audited crypto.
+// Env: SPECTER_PSK (64 hex, required). SPECTER_LISTEN (default ":43117", TCP+UDP).
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,16 +15,29 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
+)
+
+const (
+	version   = 0x01
+	cellSize  = 1024
+	cellPT    = 996 // 1024 - 12 nonce - 16 tag
+	cellData  = 994 // 996 - 2 len
+	dgramSize = 1280
+	maxConns  = 1024
+	dialTO    = 10 * time.Second
+	nonceTTL  = 10 * time.Minute
+	udpIdle   = 120 * time.Second
+	udpGap    = 500 * time.Millisecond
+
+	udpMaxPayload = 1200
 )
 
 var psk = mustPSK()
 
 func mustPSK() []byte {
-	raw := os.Getenv("SPECTER_PSK")
-	if raw == "" {
-		log.Fatal("SPECTER_PSK is not set (32-byte key as 64 hex chars)")
-	}
-	b, err := hex.DecodeString(raw)
+	b, err := hex.DecodeString(os.Getenv("SPECTER_PSK"))
 	if err != nil || len(b) != 32 {
 		log.Fatal("SPECTER_PSK must be 64 hex chars")
 	}
@@ -36,230 +50,97 @@ func listenAddr() string {
 	}
 	return "0.0.0.0:43117"
 }
-var magic = []byte{'R', '1', 0x07, 0x9d}
 
-const (
-	maxFrame = 16383
-	maxConns = 1024
-	dialTO   = 10 * time.Second
-)
-
-type xstream struct {
-	nonce []byte
-	dir   byte
-	ctr   uint32
-	buf   []byte
-}
-
-func (x *xstream) run(data []byte) []byte {
-	out := make([]byte, len(data))
-	off := 0
-	for off < len(data) {
-		if len(x.buf) == 0 {
-			h := sha256.New()
-			h.Write(psk)
-			h.Write(x.nonce)
-			h.Write([]byte{x.dir})
-			var c [4]byte
-			binary.BigEndian.PutUint32(c[:], x.ctr)
-			h.Write(c[:])
-			x.buf = h.Sum(nil)
-			x.ctr++
-		}
-		n := len(x.buf)
-		if rem := len(data) - off; rem < n {
-			n = rem
-		}
-		for i := 0; i < n; i++ {
-			out[off+i] = data[off+i] ^ x.buf[i]
-		}
-		// advance
-		off += n
-		x.buf = x.buf[n:]
-	}
-	return out
-}
-
-func readFrame(r io.Reader, x *xstream) ([]byte, error) {
-	var hdr [2]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	ln := int(binary.BigEndian.Uint16(hdr[:]))
-	if ln == 0 || ln > maxFrame {
-		return nil, io.ErrUnexpectedEOF
-	}
-	enc := make([]byte, ln)
-	if _, err := io.ReadFull(r, enc); err != nil {
-		return nil, err
-	}
-	return x.run(enc), nil
-}
-
-func writeFrame(w io.Writer, x *xstream, data []byte) error {
-	enc := x.run(data)
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(len(enc)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(enc)
-	return err
-}
-
-func handle(c net.Conn, sem chan struct{}) {
-	defer c.Close()
-	defer func() { <-sem }()
-
-	head := make([]byte, 36)
-	if _, err := io.ReadFull(c, head); err != nil {
-		return
-	}
-	if string(head[:4]) != string(magic) {
-		return
-	}
-	nonce := append([]byte(nil), head[4:20]...)
-	m := hmac.New(sha256.New, psk)
-	m.Write(magic)
-	m.Write(nonce)
-	if !hmac.Equal(m.Sum(nil)[:16], head[20:36]) {
-		return
-	}
-	atyp := make([]byte, 1)
-	if _, err := io.ReadFull(c, atyp); err != nil {
-		return
-	}
-	var host string
-	switch atyp[0] {
-	case 0x01:
-		b := make([]byte, 4)
-		if _, err := io.ReadFull(c, b); err != nil {
-			return
-		}
-		host = net.IP(b).String()
-	case 0x03:
-		l := make([]byte, 1)
-		if _, err := io.ReadFull(c, l); err != nil {
-			return
-		}
-		b := make([]byte, int(l[0]))
-		if _, err := io.ReadFull(c, b); err != nil {
-			return
-		}
-		host = string(b)
-	case 0x04:
-		b := make([]byte, 16)
-		if _, err := io.ReadFull(c, b); err != nil {
-			return
-		}
-		host = net.IP(b).String()
-	default:
-		return
-	}
-	pb := make([]byte, 2)
-	if _, err := io.ReadFull(c, pb); err != nil {
-		return
-	}
-	target := host + ":" + itoa(int(binary.BigEndian.Uint16(pb)))
-	t, err := net.DialTimeout("tcp", target, dialTO)
-	if err != nil {
-		return
-	}
-	defer t.Close()
-
-	up := &xstream{nonce: nonce, dir: 0}
-	down := &xstream{nonce: nonce, dir: 1}
-	done := make(chan struct{}, 2)
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		for {
-			d, err := readFrame(c, up)
-			if err != nil {
-				return
-			}
-			t.SetDeadline(time.Now().Add(3 * time.Minute))
-			if _, err := t.Write(d); err != nil {
-				return
-			}
-		}
-	}()
-	go func() {
-		defer func() { done <- struct{}{} }()
-		buf := make([]byte, maxFrame)
-		for {
-			t.SetDeadline(time.Now().Add(3 * time.Minute))
-			n, err := t.Read(buf)
-			if err != nil || n == 0 {
-				return
-			}
-			c.SetDeadline(time.Now().Add(3 * time.Minute))
-			if err := writeFrame(c, down, buf[:n]); err != nil {
-				return
-			}
-		}
-	}()
-	<-done
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [8]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}
-
-// ---------- UDP transport ----------
-// Datagram client->server:
-//   MAGIC(4) nonce(16) tag(16) seq u32 atyp addr port u16 flen u16 payload
-// Datagram server->client:
-//   MAGIC(4) nonce(16) seq u32 flen u16 payload
-// Payload crypto is per-datagram (loss/reorder safe):
-//   block(nonce,dir,seq,blk) = SHA256(PSK||nonce||dir||BE32(seq)||BE32(blk))
-
-const (
-	udpMaxPayload = 1200
-	udpIdle       = 120 * time.Second
-	udpGapWait    = 500 * time.Millisecond
-)
-
-func ksU(nonce []byte, dir byte, seq, blk uint32) []byte {
+func sessionKey(hsNonce []byte) []byte {
 	h := sha256.New()
 	h.Write(psk)
-	h.Write(nonce)
-	h.Write([]byte{dir})
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], seq)
-	h.Write(b[:])
-	binary.BigEndian.PutUint32(b[:], blk)
-	h.Write(b[:])
-	return h.Sum(nil)
+	h.Write([]byte("specter-v2-key"))
+	h.Write(hsNonce)
+	sum := h.Sum(nil)
+	a, err := chacha20poly1305.New(sum)
+	if err != nil {
+		panic(err)
+	}
+	_ = a
+	return sum
 }
 
-func cryptU(nonce []byte, dir byte, seq uint32, data []byte) []byte {
-	out := make([]byte, len(data))
-	var blk uint32
-	off := 0
-	for off < len(data) {
-		ks := ksU(nonce, dir, seq, blk)
-		blk++
-		n := len(ks)
-		if rem := len(data) - off; rem < n {
-			n = rem
-		}
-		for i := 0; i < n; i++ {
-			out[off+i] = data[off+i] ^ ks[i]
-		}
-		off += n
+// ---------- replay cache ----------
+
+var nonceCache = struct {
+	sync.Mutex
+	m map[string]time.Time
+}{m: map[string]time.Time{}}
+
+func nonceSeen(nonce []byte) bool {
+	k := string(nonce)
+	now := time.Now()
+	nonceCache.Lock()
+	defer nonceCache.Unlock()
+	if exp, ok := nonceCache.m[k]; ok && now.Before(exp) {
+		return true
 	}
+	nonceCache.m[k] = now.Add(nonceTTL)
+	if len(nonceCache.m) > 200000 {
+		for kk, exp := range nonceCache.m {
+			if now.After(exp) {
+				delete(nonceCache.m, kk)
+			}
+		}
+	}
+	return false
+}
+
+func nonceSweeper() {
+	for range time.Tick(time.Minute) {
+		now := time.Now()
+		nonceCache.Lock()
+		for k, exp := range nonceCache.m {
+			if now.After(exp) {
+				delete(nonceCache.m, k)
+			}
+		}
+		nonceCache.Unlock()
+	}
+}
+
+// ---------- TCP cells ----------
+
+func sealCell(sk, data []byte) []byte {
+	if len(data) > cellData {
+		data = data[:cellData]
+	}
+	pt := make([]byte, cellPT)
+	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
+	copy(pt[2:], data)
+	if _, err := rand.Read(pt[2+len(data):]); err != nil {
+		panic(err)
+	}
+	a, _ := chacha20poly1305.New(sk)
+	rnonce := make([]byte, 12)
+	if _, err := rand.Read(rnonce); err != nil {
+		panic(err)
+	}
+	out := make([]byte, 0, cellSize)
+	out = append(out, rnonce...)
+	out = append(out, a.Seal(nil, rnonce, pt, nil)...)
 	return out
+}
+
+func openCell(sk, cell []byte) ([]byte, error) {
+	if len(cell) != cellSize {
+		return nil, io.ErrUnexpectedEOF
+	}
+	a, _ := chacha20poly1305.New(sk)
+	pt, err := a.Open(nil, cell[:12], cell[12:], nil)
+	if err != nil {
+		return nil, err
+	}
+	ln := int(binary.BigEndian.Uint16(pt[:2]))
+	if ln < 0 || ln > cellData {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return pt[2 : 2+ln], nil
 }
 
 func parseAddr(buf []byte) (host string, rest []byte, ok bool) {
@@ -286,6 +167,100 @@ func parseAddr(buf []byte) (host string, rest []byte, ok bool) {
 	return "", nil, false
 }
 
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [8]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+func checkHandshake(hs []byte) (nonce []byte, ok bool) {
+	if len(hs) != 37 || hs[0] != version {
+		return nil, false
+	}
+	m := hmac.New(sha256.New, psk)
+	m.Write(hs[:21])
+	if !hmac.Equal(m.Sum(nil)[:16], hs[21:37]) {
+		return nil, false
+	}
+	return append([]byte(nil), hs[5:21]...), true
+}
+
+func handleTCP(c net.Conn, sem chan struct{}) {
+	defer c.Close()
+	defer func() { <-sem }()
+	hs := make([]byte, 37)
+	if _, err := io.ReadFull(c, hs); err != nil {
+		return
+	}
+	nonce, ok := checkHandshake(hs)
+	if !ok || nonceSeen(nonce) {
+		return
+	}
+	sk := sessionKey(nonce)
+	first := make([]byte, cellSize)
+	if _, err := io.ReadFull(c, first); err != nil {
+		return
+	}
+	tgt, err := openCell(sk, first)
+	if err != nil {
+		return
+	}
+	host, rest, ok := parseAddr(tgt)
+	if !ok || len(rest) < 2 {
+		return
+	}
+	target := host + ":" + itoa(int(binary.BigEndian.Uint16(rest[:2])))
+	t, err := net.DialTimeout("tcp", target, dialTO)
+	if err != nil {
+		return
+	}
+	defer t.Close()
+	done := make(chan struct{}, 2)
+	go func() {
+		defer func() { done <- struct{}{} }()
+		cell := make([]byte, cellSize)
+		for {
+			if _, err := io.ReadFull(c, cell); err != nil {
+				return
+			}
+			d, err := openCell(sk, cell)
+			if err != nil {
+				return
+			}
+			t.SetDeadline(time.Now().Add(3 * time.Minute))
+			if _, err := t.Write(d); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, cellData)
+		for {
+			t.SetDeadline(time.Now().Add(3 * time.Minute))
+			n, err := t.Read(buf)
+			if err != nil || n == 0 {
+				return
+			}
+			c.SetDeadline(time.Now().Add(3 * time.Minute))
+			if _, err := c.Write(sealCell(sk, buf[:n])); err != nil {
+				return
+			}
+		}
+	}()
+	<-done
+}
+
+// ---------- UDP ----------
+
 type udpSession struct {
 	target  net.Conn
 	sendSeq uint32
@@ -293,6 +268,7 @@ type udpSession struct {
 	pending map[uint32][]byte
 	gapSince time.Time
 	last    time.Time
+	sk      []byte
 	mu      sync.Mutex
 }
 
@@ -300,10 +276,6 @@ var (
 	udpMu       sync.Mutex
 	udpSessions = map[string]*udpSession{}
 )
-
-func udpKey(addr *net.UDPAddr, nonce []byte) string {
-	return addr.String() + "|" + hex.EncodeToString(nonce)
-}
 
 func udpReaper() {
 	for range time.Tick(30 * time.Second) {
@@ -322,7 +294,37 @@ func udpReaper() {
 	}
 }
 
-func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, nonce []byte, s *udpSession) {
+func openDgram(sk, sid []byte, pkt []byte) (flags byte, seq uint32, data []byte, ok bool) {
+	if len(pkt) < 8+12+1+4+2+16 {
+		return 0, 0, nil, false
+	}
+	if string(pkt[:8]) != string(sid) {
+		return 0, 0, nil, false
+	}
+	rnonce := pkt[8:20]
+	flags = pkt[20]
+	seq = binary.BigEndian.Uint32(pkt[21:25])
+	ct := pkt[25:]
+	a, _ := chacha20poly1305.New(sk)
+	ad := make([]byte, 0, 13)
+	ad = append(ad, sid...)
+	ad = append(ad, flags)
+	ad = append(ad, pkt[21:25]...)
+	pt, err := a.Open(nil, rnonce, ct, ad)
+	if err != nil {
+		return 0, 0, nil, false
+	}
+	if len(pt) < 2 {
+		return 0, 0, nil, false
+	}
+	ln := int(binary.BigEndian.Uint16(pt[:2]))
+	if ln < 0 || 2+ln > len(pt) {
+		return 0, 0, nil, false
+	}
+	return flags, seq, pt[2 : 2+ln], true
+}
+
+func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s *udpSession) {
 	buf := make([]byte, udpMaxPayload)
 	for {
 		s.target.SetDeadline(time.Now().Add(3 * time.Minute))
@@ -333,18 +335,28 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, nonce []byte, s *
 		s.mu.Lock()
 		seq := s.sendSeq
 		s.sendSeq++
+		s.last = time.Now()
 		s.mu.Unlock()
-		enc := cryptU(nonce, 1, seq, buf[:n])
-		out := make([]byte, 0, 4+16+4+2+len(enc))
-		out = append(out, magic...)
-		out = append(out, nonce...)
-		var b [4]byte
-		binary.BigEndian.PutUint32(b[:], seq)
-		out = append(out, b[:]...)
-		var l [2]byte
-		binary.BigEndian.PutUint16(l[:], uint16(len(enc)))
-		out = append(out, l[:]...)
-		out = append(out, enc...)
+		rnonce := make([]byte, 12)
+		if _, err := rand.Read(rnonce); err != nil {
+			break
+		}
+		// pad plaintext to full budget so every datagram is dgramSize
+		pt := make([]byte, 1239)
+		binary.BigEndian.PutUint16(pt[:2], uint16(n))
+		copy(pt[2:], buf[:n])
+		if _, err := rand.Read(pt[2+n:]); err != nil {
+			break
+		}
+		a, _ := chacha20poly1305.New(sk)
+		ad := append(append(append([]byte(nil), sid...), 0), uint32be(seq)...)
+		ct := a.Seal(nil, rnonce, pt, ad)
+		out := make([]byte, 0, dgramSize)
+		out = append(out, sid...)
+		out = append(out, rnonce...)
+		out = append(out, 0)
+		out = append(out, uint32be(seq)...)
+		out = append(out, ct...)
 		conn.WriteToUDP(out, addr)
 	}
 	udpMu.Lock()
@@ -354,59 +366,26 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, nonce []byte, s *
 	udpMu.Unlock()
 }
 
-func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
-	if len(pkt) < 4+16+16+4+1+2+2 {
-		return
-	}
-	if string(pkt[:4]) != string(magic) {
-		return
-	}
-	nonce := append([]byte(nil), pkt[4:20]...)
-	m := hmac.New(sha256.New, psk)
-	m.Write(magic)
-	m.Write(nonce)
-	if !hmac.Equal(m.Sum(nil)[:16], pkt[20:36]) {
-		return
-	}
-	seq := binary.BigEndian.Uint32(pkt[36:40])
-	host, rest, ok := parseAddr(pkt[40:])
-	if !ok || len(rest) < 4 {
-		return
-	}
-	port := binary.BigEndian.Uint16(rest[:2])
-	rest = rest[2:]
-	flen := int(binary.BigEndian.Uint16(rest[:2]))
-	rest = rest[2:]
-	if len(rest) < flen || flen > udpMaxPayload {
-		return
-	}
-	plain := cryptU(nonce, 0, seq, rest[:flen])
+func uint32be(v uint32) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], v)
+	return b[:]
+}
 
-	key := udpKey(addr, nonce)
-	udpMu.Lock()
-	s, found := udpSessions[key]
-	if !found {
-		t, err := net.DialTimeout("tcp", host+":"+itoa(int(port)), dialTO)
-		if err != nil {
-			udpMu.Unlock()
-			return
-		}
-		s = &udpSession{target: t, pending: map[uint32][]byte{}, last: time.Now()}
-		udpSessions[key] = s
-		udpMu.Unlock()
-		go udpPump(conn, key, addr, nonce, s)
-	} else {
-		udpMu.Unlock()
-	}
+func deliverUDP(s *udpSession, seq uint32, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.last = time.Now()
 	if seq < s.expect {
 		return
 	}
+	write := func(d []byte) bool {
+		s.target.SetDeadline(time.Now().Add(30 * time.Second))
+		_, err := s.target.Write(d)
+		return err == nil
+	}
 	if seq == s.expect {
-		s.target.SetDeadline(time.Now().Add(3 * time.Minute))
-		if _, err := s.target.Write(plain); err != nil {
+		if !write(data) {
 			return
 		}
 		s.expect++
@@ -416,7 +395,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 				break
 			}
 			delete(s.pending, s.expect)
-			if _, err := s.target.Write(d); err != nil {
+			if !write(d) {
 				return
 			}
 			s.expect++
@@ -424,16 +403,14 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 		s.gapSince = time.Time{}
 		return
 	}
-	if len(s.pending) >= 64 {
-		return
-	}
-	if _, dup := s.pending[seq]; !dup {
-		s.pending[seq] = plain
+	if len(s.pending) < 64 {
+		if _, dup := s.pending[seq]; !dup {
+			s.pending[seq] = data
+		}
 	}
 	if s.gapSince.IsZero() {
 		s.gapSince = time.Now()
-	} else if time.Since(s.gapSince) > udpGapWait {
-		// gap stuck: skip to smallest buffered seq
+	} else if time.Since(s.gapSince) > udpGap {
 		min := seq
 		for k := range s.pending {
 			if k < min {
@@ -449,7 +426,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 				break
 			}
 			delete(s.pending, s.expect)
-			if _, err := s.target.Write(d); err != nil {
+			if !write(d) {
 				return
 			}
 			s.expect++
@@ -458,31 +435,124 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	}
 }
 
+func lookupSession(sid []byte) *udpSession {
+	suffix := string(sid)
+	udpMu.Lock()
+	defer udpMu.Unlock()
+	for k, v := range udpSessions {
+		if len(k) > 8 && k[len(k)-8:] == suffix {
+			return v
+		}
+	}
+	return nil
+}
+
+func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
+	if len(pkt) != dgramSize {
+		return
+	}
+	// subsequent datagram? sid = first 8 bytes, matched as session-key suffix.
+	// Retry briefly: the session-creating first datagram may still be in flight.
+	if len(pkt) >= 8 {
+		s := lookupSession(pkt[:8])
+		if s == nil && pkt[0] != version {
+			for i := 0; i < 4 && s == nil; i++ {
+				time.Sleep(50 * time.Millisecond)
+				s = lookupSession(pkt[:8])
+			}
+		}
+		if s != nil {
+			flags, seq, data, ok := openDgram(s.sk, pkt[:8], pkt)
+			if !ok {
+				return
+			}
+			_ = flags
+			deliverUDP(s, seq, data)
+			return
+		}
+	}
+	// new session: ver(1) magic(4) hs_nonce(16) tag(16) sid(8) seq(4) flags(1) AEAD
+	if pkt[0] != version {
+		return
+	}
+	hsNonce := append([]byte(nil), pkt[5:21]...)
+	m := hmac.New(sha256.New, psk)
+	m.Write(pkt[:21])
+	if !hmac.Equal(m.Sum(nil)[:16], pkt[21:37]) {
+		return
+	}
+	if nonceSeen(hsNonce) {
+		return
+	}
+	sk := sessionKey(hsNonce)
+	sid := append([]byte(nil), pkt[37:45]...)
+	seq := binary.BigEndian.Uint32(pkt[45:49])
+	flags := pkt[49]
+	if flags&1 == 0 {
+		return
+	}
+	// AEAD over remainder: rnonce = hsNonce[:12]
+	a, _ := chacha20poly1305.New(sk)
+	ad := append(append(append([]byte(nil), sid...), flags), pkt[45:49]...)
+	pt, err := a.Open(nil, hsNonce[:12], pkt[50:], ad)
+	if err != nil {
+		return
+	}
+	// pt budget 1214: atyp+addr+port (addr-only first datagram)
+	host, rest, ok := parseAddr(pt)
+	if !ok || len(rest) < 2 {
+		return
+	}
+	_ = seq
+	target := host + ":" + itoa(int(binary.BigEndian.Uint16(rest[:2])))
+	t, err := net.DialTimeout("tcp", target, dialTO)
+	if err != nil {
+		return
+	}
+	key := addr.String() + "|" + string(sid)
+	udpMu.Lock()
+	if old, dup := udpSessions[key]; dup {
+		old.target.Close()
+	}
+	s := &udpSession{target: t, pending: map[uint32][]byte{}, last: time.Now(), sk: append([]byte(nil), sk...)}
+	udpSessions[key] = s
+	udpMu.Unlock()
+	go udpPump(conn, key, addr, sid, s.sk, s)
+	return
+}
+
+func udpLoop(uconn *net.UDPConn) {
+	buf := make([]byte, 2048)
+	for {
+		n, addr, err := uconn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		pkt := append([]byte(nil), buf[:n]...)
+		go handleUDP(uconn, addr, pkt)
+	}
+}
+
 func main() {
 	ln, err := net.Listen("tcp", listenAddr())
 	if err != nil {
 		panic(err)
 	}
-	uaddr, err := net.ResolveUDPAddr("udp", listenAddr())
-	if err != nil {
-		panic(err)
-	}
-	uconn, err := net.ListenUDP("udp", uaddr)
-	if err != nil {
-		panic(err)
-	}
-	go udpReaper()
-	go func() {
-		buf := make([]byte, 2048)
-		for {
-			n, addr, err := uconn.ReadFromUDP(buf)
-			if err != nil {
-				continue
-			}
-			pkt := append([]byte(nil), buf[:n]...)
-			go handleUDP(uconn, addr, pkt)
+	// SPECTER_TRANSPORT=tcp -> TCP only; anything else -> TCP+UDP.
+	// (TCP is always kept: old clients and fallback need it.)
+	if os.Getenv("SPECTER_TRANSPORT") != "tcp" {
+		uaddr, err := net.ResolveUDPAddr("udp", listenAddr())
+		if err != nil {
+			panic(err)
 		}
-	}()
+		uconn, err := net.ListenUDP("udp", uaddr)
+		if err != nil {
+			panic(err)
+		}
+		go udpLoop(uconn)
+	}
+	go nonceSweeper()
+	go udpReaper()
 	sem := make(chan struct{}, maxConns)
 	for {
 		c, err := ln.Accept()
@@ -491,7 +561,7 @@ func main() {
 		}
 		select {
 		case sem <- struct{}{}:
-			go handle(c, sem)
+			go handleTCP(c, sem)
 		default:
 			c.Close()
 		}

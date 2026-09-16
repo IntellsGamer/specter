@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Specter client: SOCKS5 on 127.0.0.1:10867 -> Specter protocol -> server.
-Point v2ray outbound (socks) at 127.0.0.1:10867.
-
-Configure (first found wins for each value):
-  1. config.json next to this file (copy config.example.json), or
-     pass a path:  python3 client.py myconfig.json
-  2. env vars: SPECTER_SERVER / SPECTER_PORT / SPECTER_PSK
-
-Toy obfuscation, NOT audited crypto."""
+"""Specter v2 client: SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+Config: config.json next to this file (see config.example.json), or
+  python3 client.py other.json. Env SPECTER_SERVER/PORT/PSK/TRANSPORT override.
+AEAD: uses `cryptography` lib if installed, else embedded pure-Python fallback.
+Not audited crypto; toy obfuscation with real authentication."""
 import hashlib
 import hmac
 import json
@@ -18,7 +14,18 @@ import sys
 import threading
 import time
 
+VERSION = 0x01
 DEFAULT_PORT = 43117
+CELL = 1024
+CELL_PT = 996
+CELL_DATA = 994
+DGRAM = 1280
+DGRAM_PT = 1239
+DGRAM_DATA = 1237
+FIRST_PT = 1214
+UDP_CHUNK = 1200
+UDP_REORDER_MAX = 64
+UDP_GAP_WAIT = 0.3
 
 
 def _load_config():
@@ -62,34 +69,87 @@ def _load_config():
 
 
 SERVER, SPORT, PSK, TRANSPORT = _load_config()
-MAGIC = b"R1\x07\x9d"
-MAXFRAME = 16383
 
 
-def _ks(nonce, direction, counter):
-    return hashlib.sha256(PSK + nonce + bytes((direction,)) + struct.pack(">I", counter)).digest()
+# ---------- AEAD (fast lib if present, else pure Python) ----------
 
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305 as _C20P
+    from cryptography.exceptions import InvalidTag as _InvalidTag
 
-class XorStream:
-    def __init__(self, nonce, direction):
-        self.nonce = nonce
-        self.dir = direction
-        self.ctr = 0
-        self.buf = b""
+    def aead_seal(sk, nonce, pt, aad):
+        return _C20P(sk).encrypt(nonce, pt, aad if aad else None)
 
-    def run(self, data):
+    def aead_open(sk, nonce, ct, aad):
+        try:
+            return _C20P(sk).decrypt(nonce, ct, aad if aad else None)
+        except _InvalidTag:
+            raise ValueError("bad tag")
+
+    AEAD_IMPL = "cryptography"
+except ImportError:
+    def _rotl(v, n):
+        return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF
+
+    def _qr(x, a, b, c, d):
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF; x[d] ^= x[a]; x[d] = _rotl(x[d], 16)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF; x[b] ^= x[c]; x[b] = _rotl(x[b], 12)
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF; x[d] ^= x[a]; x[d] = _rotl(x[d], 8)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF; x[b] ^= x[c]; x[b] = _rotl(x[b], 7)
+
+    def _block(key, nonce12, ctr):
+        st = [0x61707865, 0x3320646E, 0x79622D32, 0x6B206574]
+        st += list(struct.unpack("<8I", key)) + [ctr & 0xFFFFFFFF]
+        st += list(struct.unpack("<3I", nonce12))
+        w = st[:]
+        for _ in range(10):
+            _qr(w, 0, 4, 8, 12); _qr(w, 1, 5, 9, 13)
+            _qr(w, 2, 6, 10, 14); _qr(w, 3, 7, 11, 15)
+            _qr(w, 0, 5, 10, 15); _qr(w, 1, 6, 11, 12)
+            _qr(w, 2, 7, 8, 13); _qr(w, 3, 4, 9, 14)
+        return struct.pack("<16I", *[((a + b) & 0xFFFFFFFF) for a, b in zip(st, w)])
+
+    def _xor(key, nonce12, data, ctr=1):
         out = bytearray()
-        off = 0
-        n = len(data)
-        while off < n:
-            if not self.buf:
-                self.buf = _ks(self.nonce, self.dir, self.ctr)
-                self.ctr += 1
-            take = min(len(self.buf), n - off)
-            out += bytes(c ^ k for c, k in zip(data[off:off + take], self.buf))
-            self.buf = self.buf[take:]
-            off += take
+        while data:
+            ks = _block(key, nonce12, ctr)
+            ctr += 1
+            n = min(len(ks), len(data))
+            out += bytes(a ^ b for a, b in zip(data[:n], ks))
+            data = data[n:]
         return bytes(out)
+
+    _P130 = (1 << 130) - 5
+
+    def _mac(msg, key32):
+        r = int.from_bytes(key32[:16], "little") & 0xFFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+        s = int.from_bytes(key32[16:], "little")
+        acc = 0
+        for i in range(0, len(msg), 16):
+            blk = msg[i:i + 16]
+            acc = ((acc + (int.from_bytes(blk, "little") + (1 << (8 * len(blk))))) * r) % _P130
+        return ((acc + s) % (1 << 128)).to_bytes(16, "little")
+
+    def _pad16(m):
+        return m + (b"\x00" * (-len(m) % 16))
+
+    def aead_seal(sk, nonce, pt, aad):
+        ct = _xor(sk, nonce, pt, 1)
+        m = _pad16(aad) + _pad16(ct) + struct.pack("<Q", len(aad)) + struct.pack("<Q", len(ct))
+        return ct + _mac(m, _block(sk, nonce, 0)[:32])
+
+    def aead_open(sk, nonce, blob, aad):
+        ct, tag = blob[:-16], blob[-16:]
+        m = _pad16(aad) + _pad16(ct) + struct.pack("<Q", len(aad)) + struct.pack("<Q", len(ct))
+        if not hmac.compare_digest(_mac(m, _block(sk, nonce, 0)[:32]), tag):
+            raise ValueError("bad tag")
+        return _xor(sk, nonce, ct, 1)
+
+    AEAD_IMPL = "pure-python"
+
+
+def session_key(hs_nonce):
+    return hashlib.sha256(PSK + b"specter-v2-key" + hs_nonce).digest()
 
 
 def recvn(s, n):
@@ -102,55 +162,72 @@ def recvn(s, n):
     return b
 
 
-def relay_plain_to_framed(src, dst, enc):
+def seal_cell(sk, rnonce, data):
+    data = data[:CELL_DATA]
+    pt = struct.pack(">H", len(data)) + data + os.urandom(CELL_PT - 2 - len(data))
+    return rnonce + aead_seal(sk, rnonce, pt, b"")
+
+
+def open_cell(sk, cell):
+    pt = aead_open(sk, cell[:12], cell[12:], b"")
+    ln = struct.unpack(">H", pt[:2])[0]
+    if ln > CELL_DATA:
+        raise ValueError("bad len")
+    return pt[2:2 + ln]
+
+
+def relay_tcp(app, atyp, addr, port):
+    upstream = None
     try:
-        while True:
-            data = src.recv(16383)
-            if not data:
-                break
-            blob = enc.run(data)
-            dst.sendall(struct.pack(">H", len(blob)) + blob)
+        magic = os.urandom(4)
+        nonce = os.urandom(16)
+        tag = hmac.new(PSK, bytes((VERSION,)) + magic + nonce, hashlib.sha256).digest()[:16]
+        sk = session_key(nonce)
+        upstream = socket.create_connection((SERVER, SPORT), timeout=10)
+        upstream.sendall(bytes((VERSION,)) + magic + nonce + tag)
+        upstream.sendall(seal_cell(sk, os.urandom(12), bytes((atyp,)) + addr + port))
+        app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+
+        def down():
+            try:
+                while True:
+                    yield open_cell(sk, recvn(upstream, CELL))
+            except (OSError, EOFError, ValueError):
+                pass
+
+        def pump_down():
+            try:
+                for chunk in down():
+                    app.sendall(chunk)
+            except OSError:
+                pass
+
+        t = threading.Thread(target=pump_down, daemon=True)
+        t.start()
+        try:
+            while True:
+                data = app.recv(CELL_DATA)
+                if not data:
+                    break
+                upstream.sendall(seal_cell(sk, os.urandom(12), data))
+        except OSError:
+            pass
     except (OSError, EOFError):
         pass
-
-
-def relay_framed_to_plain(src, dst, dec):
-    try:
-        while True:
-            ln = struct.unpack(">H", recvn(src, 2))[0]
-            if ln == 0 or ln > MAXFRAME:
-                break
-            dst.sendall(dec.run(recvn(src, ln)))
-    except (OSError, EOFError):
-        pass
-
-
-UDP_CHUNK = 1200
-UDP_REORDER_MAX = 64
-UDP_GAP_WAIT = 0.3
-
-
-def _ks_u(nonce, direction, seq, blk):
-    return hashlib.sha256(
-        PSK + nonce + bytes((direction,)) + struct.pack(">I", seq) + struct.pack(">I", blk)
-    ).digest()
-
-
-def crypt_u(nonce, direction, seq, data):
-    out = bytearray()
-    blk = 0
-    off = 0
-    while off < len(data):
-        ks = _ks_u(nonce, direction, seq, blk)
-        blk += 1
-        take = min(len(ks), len(data) - off)
-        out += bytes(c ^ k for c, k in zip(data[off:off + take], ks))
-        off += take
-    return bytes(out)
+    finally:
+        try:
+            app.close()
+        except OSError:
+            pass
+        if upstream is not None:
+            try:
+                upstream.close()
+            except OSError:
+                pass
 
 
 def udp_leg(app, atyp, addr, port):
-    """Relay one SOCKS connection over UDP datagrams to the server."""
+    """Relay one SOCKS connection over fixed-size AEAD UDP datagrams."""
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         us.settimeout(30)
@@ -158,15 +235,33 @@ def udp_leg(app, atyp, addr, port):
     except OSError:
         us.close()
         return
-    nonce = os.urandom(16)
-    tag = hmac.new(PSK, MAGIC + nonce, hashlib.sha256).digest()[:16]
-    header = MAGIC + nonce + tag
+    magic = os.urandom(4)
+    hs_nonce = os.urandom(16)
+    tag = hmac.new(PSK, bytes((VERSION,)) + magic + hs_nonce, hashlib.sha256).digest()[:16]
+    sk = session_key(hs_nonce)
+    sid = os.urandom(8)
     target = bytes((atyp,)) + addr + port
     dead = threading.Event()
+
+    def first_datagram():
+        pt = target + os.urandom(FIRST_PT - len(target))
+        ad = sid + b"\x01" + struct.pack(">I", 0)
+        ct = aead_seal(sk, hs_nonce[:12], pt, ad)
+        return (bytes((VERSION,)) + magic + hs_nonce + tag + sid
+                + struct.pack(">I", 0) + b"\x01" + ct)
+
+    def data_datagram(seq, data):
+        data = data[:DGRAM_DATA]
+        pt = struct.pack(">H", len(data)) + data + os.urandom(DGRAM_PT - 2 - len(data))
+        rnonce = os.urandom(12)
+        ad = sid + b"\x00" + struct.pack(">I", seq)
+        ct = aead_seal(sk, rnonce, pt, ad)
+        return sid + rnonce + b"\x00" + struct.pack(">I", seq) + ct
 
     def sender():
         seq = 0
         try:
+            us.sendall(first_datagram())
             while not dead.is_set():
                 try:
                     data = app.recv(UDP_CHUNK)
@@ -174,12 +269,24 @@ def udp_leg(app, atyp, addr, port):
                     break
                 if not data:
                     break
-                blob = crypt_u(nonce, 0, seq, data)
-                us.sendall(header + struct.pack(">I", seq) + target
-                           + struct.pack(">H", len(blob)) + blob)
+                us.sendall(data_datagram(seq, data))
                 seq += 1
         finally:
             dead.set()
+
+    def parse_reply(dg):
+        if len(dg) != DGRAM or dg[:8] != sid:
+            return None
+        rnonce, flags = dg[8:20], dg[20:21]
+        seq = struct.unpack(">I", dg[21:25])[0]
+        try:
+            pt = aead_open(sk, rnonce, dg[25:], dg[:8] + flags + dg[21:25])
+        except ValueError:
+            return None
+        ln = struct.unpack(">H", pt[:2])[0]
+        if ln > DGRAM_DATA:
+            return None
+        return seq, pt[2:2 + ln]
 
     try:
         app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -193,18 +300,14 @@ def udp_leg(app, atyp, addr, port):
                 dg, _ = us.recvfrom(2048)
             except socket.timeout:
                 break
-            if len(dg) < 4 + 16 + 4 + 2 or dg[:4] != MAGIC:
+            parsed = parse_reply(dg)
+            if parsed is None:
                 continue
-            if dg[4:20] != nonce:
-                continue
-            seq = struct.unpack(">I", dg[20:24])[0]
-            flen = struct.unpack(">H", dg[24:26])[0]
-            if len(dg) < 26 + flen:
-                continue
+            seq, data = parsed
             if seq < expect or seq in pending:
                 continue
             if len(pending) < UDP_REORDER_MAX:
-                pending[seq] = crypt_u(nonce, 1, seq, dg[26:26 + flen])
+                pending[seq] = data
             drained = False
             while expect in pending:
                 try:
@@ -214,7 +317,7 @@ def udp_leg(app, atyp, addr, port):
                     break
                 expect += 1
                 drained = True
-            if drained or expect in pending:
+            if drained:
                 gap_since = None
             elif pending:
                 if gap_since is None:
@@ -260,25 +363,13 @@ def handle(app):
         if TRANSPORT == "udp":
             udp_leg(app, atyp, addr, port)
             return
-        nonce = os.urandom(16)
-        tag = hmac.new(PSK, MAGIC + nonce, hashlib.sha256).digest()[:16]
-        upstream = socket.create_connection((SERVER, SPORT), timeout=10)
-        upstream.sendall(MAGIC + nonce + tag + bytes((atyp,)) + addr + port)
-        app.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-        up, down = XorStream(nonce, 0), XorStream(nonce, 1)
-        t = threading.Thread(target=relay_framed_to_plain, args=(upstream, app, down), daemon=True)
-        t.start()
-        relay_plain_to_framed(app, upstream, up)
+        relay_tcp(app, atyp, addr, port)
     except (OSError, EOFError):
         pass
     finally:
-        try:
-            app.close()
-        except OSError:
-            pass
-        if upstream is not None:
+        if TRANSPORT != "udp":
             try:
-                upstream.close()
+                app.close()
             except OSError:
                 pass
 
@@ -288,7 +379,8 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 10867))
     srv.listen(64)
-    print("socks5 on 127.0.0.1:10867 -> %s:%d [%s]" % (SERVER, SPORT, TRANSPORT), flush=True)
+    print("specter v2 [%s] socks5 127.0.0.1:10867 -> %s:%d (%s)"
+          % (AEAD_IMPL, SERVER, SPORT, TRANSPORT), flush=True)
     while True:
         app, _ = srv.accept()
         threading.Thread(target=handle, args=(app,), daemon=True).start()
