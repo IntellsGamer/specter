@@ -1,6 +1,6 @@
 package main
 
-// Specter v3.2 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+// Specter v3.3 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
 // Config: config.json (server/port/psk/transport tcp|udp|auto) or argv path.
 // Env overrides: SPECTER_SERVER/PORT/PSK/TRANSPORT.
 
@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,33 @@ func validClass(classes []int, total int) bool {
 		}
 	}
 	return false
+}
+
+// --- logging (SPECTER_LOG=error|warn|info|debug, default warn) ---
+const (
+	logError = 0
+	logWarn  = 1
+	logInfo  = 2
+	logDebug = 3
+)
+
+var logLevel = func() int {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SPECTER_LOG"))) {
+	case "debug":
+		return logDebug
+	case "info":
+		return logInfo
+	case "error":
+		return logError
+	default:
+		return logWarn
+	}
+}()
+
+func logf(level int, format string, args ...interface{}) {
+	if level <= logLevel {
+		log.Printf(format, args...)
+	}
 }
 
 // --- latency fixes ---
@@ -338,6 +366,7 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	sk0 := hsKey(psk, nonce)
 	up, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
 	if err != nil {
+		logf(logWarn, "tcp dial fail %s:%d err=%v (server down/firewalled?)", server, port, err)
 		return nil, err
 	}
 	tuneTCP(up)
@@ -358,11 +387,13 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	}
 	rep := make([]byte, 49)
 	if _, err := io.ReadFull(up, rep); err != nil {
+		logf(logWarn, "tcp no server reply %s:%d err=%v (wrong PSK/port? server overloaded?)", server, port, err)
 		up.Close()
 		return nil, err
 	}
 	if rep[0] != version {
 		up.Close()
+		logf(logError, "tcp bad version from %s:%d (incompatible server?)", server, port)
 		return nil, fmt.Errorf("bad version")
 	}
 	ephS := rep[1:33]
@@ -373,6 +404,7 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	m2.Write(nonce)
 	if !hmac.Equal(m2.Sum(nil)[:16], rep[33:49]) {
 		up.Close()
+		logf(logError, "tcp reply tag mismatch %s:%d (wrong PSK?)", server, port)
 		return nil, fmt.Errorf("bad reply tag")
 	}
 	shared, err := curve25519.X25519(ephPriv, ephS)
@@ -401,6 +433,7 @@ func handshakeTCPEarly(app net.Conn, server string, port int, psk []byte, atyp b
 	sk0 := hsKey(psk, nonce)
 	up, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
 	if err != nil {
+		logf(logWarn, "tcp dial fail %s:%d err=%v (server down/firewalled?)", server, port, err)
 		return nil, err
 	}
 	tuneTCP(up)
@@ -427,11 +460,13 @@ func handshakeTCPEarly(app net.Conn, server string, port int, psk []byte, atyp b
 	}
 	rep := make([]byte, 49)
 	if _, err := io.ReadFull(up, rep); err != nil {
+		logf(logWarn, "tcp no server reply %s:%d err=%v (wrong PSK/port? server overloaded?)", server, port, err)
 		up.Close()
 		return nil, err
 	}
 	if rep[0] != version {
 		up.Close()
+		logf(logError, "tcp bad version from %s:%d (incompatible server?)", server, port)
 		return nil, fmt.Errorf("bad version")
 	}
 	ephS := rep[1:33]
@@ -442,6 +477,7 @@ func handshakeTCPEarly(app net.Conn, server string, port int, psk []byte, atyp b
 	m2.Write(nonce)
 	if !hmac.Equal(m2.Sum(nil)[:16], rep[33:49]) {
 		up.Close()
+		logf(logError, "tcp reply tag mismatch %s:%d (wrong PSK?)", server, port)
 		return nil, fmt.Errorf("bad reply tag")
 	}
 	shared, err := curve25519.X25519(ephPriv, ephS)
@@ -465,11 +501,13 @@ func relayTCP(app net.Conn, e *established) {
 		for {
 			d, err := readRecordFast(e.up, aead)
 			if err != nil {
+				logf(logDebug, "tcp relay server->app end err=%v", err)
 				return
 			}
 			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			if _, err := app.Write(d); err != nil {
+				logf(logDebug, "tcp relay app write end err=%v", err)
 				return
 			}
 		}
@@ -482,6 +520,7 @@ func relayTCP(app net.Conn, e *established) {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
 			if err != nil || n == 0 {
+				logf(logDebug, "tcp relay app->server end err=%v", err)
 				return
 			}
 			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
@@ -630,6 +669,7 @@ func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []
 		if err != nil {
 			if time.Now().After(deadline) {
 				us.Close()
+				logf(logWarn, "udp no hello reply %s:%d (server down? UDP blocked? wrong PSK?)", server, port)
 				return nil, fmt.Errorf("no hello reply")
 			}
 			continue
@@ -712,6 +752,7 @@ func relayUDP(app net.Conn, e *established) {
 		e.us.SetReadDeadline(time.Now().Add(3 * time.Minute))
 		n, err := e.us.Read(rbuf)
 		if err != nil {
+			logf(logDebug, "udp relay end err=%v", err)
 			return
 		}
 		dg := rbuf[:n]
@@ -885,6 +926,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		if err != nil {
 			if !flipped {
 				if time.Since(hsStart) > helloTimeout {
+					logf(logWarn, "udp hello timeout %s:%d (server down? UDP blocked? wrong PSK?)", server, port)
 					return
 				}
 				us.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -998,10 +1040,12 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 	}()
 	timeout := time.After(12 * time.Second)
 	var tcpRes, udpRes *result
+	var tcpE, udpE error
 	for tcpRes == nil || udpRes == nil {
 		select {
 		case r := <-tcpCh:
 			tcpRes = &r
+			tcpE = r.err
 			if r.err == nil {
 				setPinned("tcp")
 				go func() {
@@ -1015,6 +1059,7 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 			}
 		case r := <-udpCh:
 			udpRes = &r
+			udpE = r.err
 			if r.err == nil {
 				setPinned("udp")
 				go func() {
@@ -1033,6 +1078,7 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 			if udpRes != nil && udpRes.err == nil {
 				return udpRes.es
 			}
+			logf(logWarn, "race: both transports failed %s:%d (tcp=%v udp=%v)", server, port, tcpE, udpE)
 			return nil
 		}
 	}
@@ -1042,6 +1088,7 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 	if udpRes != nil && udpRes.err == nil {
 		return udpRes.es
 	}
+	logf(logWarn, "race: both transports failed %s:%d (tcp=%v udp=%v)", server, port, tcpE, udpE)
 	return nil
 }
 
@@ -1057,6 +1104,7 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	defer app.Close()
 	ver, err := readN(app, 1)
 	if err != nil || ver[0] != 5 {
+		logf(logDebug, "socks reject: bad version err=%v", err)
 		return
 	}
 	nm, err := readN(app, 1)
@@ -1074,6 +1122,7 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 		}
 	}
 	if !ok {
+		logf(logDebug, "socks reject: no no-auth method")
 		app.Write([]byte{5, 0xff})
 		return
 	}
@@ -1082,6 +1131,7 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	}
 	hdr, err := readN(app, 4)
 	if err != nil || hdr[0] != 5 || hdr[1] != 1 {
+		logf(logDebug, "socks reject: bad request err=%v", err)
 		return
 	}
 	atyp := hdr[3]
@@ -1166,7 +1216,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("specter-go v3.2 client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
+	log.Printf("specter-go v3.3 client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
 	_ = psk
 	for {
 		c, err := ln.Accept()

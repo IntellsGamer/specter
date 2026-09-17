@@ -181,3 +181,22 @@ UDP is selected client-side by the config value. The server serves the
 mode(s) it is started with: `SPECTER_TRANSPORT=tcp` → TCP only, anything
 else → TCP+UDP on the same port. **Both ends must agree** — a `udp` client
 against a TCP-only server stalls silently (by design).
+
+## Observability (v3.3+, wire unchanged — v3.3 servers work with v3.2 clients)
+
+Both binaries log to stderr. `SPECTER_LOG=error|warn|info|debug`
+(default `warn`). Nothing secret (no keys) is ever logged.
+
+- `warn` (default): target dial failures and slow dials (`>2s`) with the
+  target host — this is where user-visible `-1`s and spikes come from;
+  client handshake failures with hints (`wrong PSK?`, `UDP blocked?`);
+  drops at the connection cap.
+- `info`: 5-minute counters summary
+  (`tcp_accept/drop/hs_ok/hs_reject/dial_fail/dial_slow`,
+  `udp_hello_ok/hello_reject/dial_fail/dial_slow/done`,
+  `orphan_drained/expired`). `SPECTER_STATS_SEC` overrides the interval
+  (min 5, for tests).
+- `debug`: handshake rejects, hello retries/dups, relay ends, orphan
+  drains. Scanner/probe noise in these categories is rate-limited
+  (1 line / 5 s + suppressed count), so the port still looks dead
+  while you keep signal.

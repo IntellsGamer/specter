@@ -1,6 +1,6 @@
 package main
 
-// Specter v3.2 server: X25519 forward secrecy + HKDF session keys + AEAD cells.
+// Specter v3.3 server: X25519 forward secrecy + HKDF session keys + AEAD cells.
 // Env: SPECTER_PSK (64 hex, required, long-term salt/auth only).
 //      SPECTER_LISTEN (default ":43117", TCP+UDP). SPECTER_TRANSPORT=tcp -> TCP only.
 // NOT audited crypto.
@@ -19,6 +19,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,6 +82,123 @@ func validClass(classes []int, total int) bool {
 		}
 	}
 	return false
+}
+
+// ---------- logging ----------
+// SPECTER_LOG=error|warn|info|debug (default warn). Unauthenticated probe
+// noise (scanners) is rate-limited at debug; anything that breaks a real
+// (handshake-verified) session logs at warn. No keys or PSK material ever
+// logged. Wire protocol untouched by all of this.
+const (
+	logError = 0
+	logWarn  = 1
+	logInfo  = 2
+	logDebug = 3
+)
+
+var logLevel = parseLogLevel(os.Getenv("SPECTER_LOG"))
+
+func parseLogLevel(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return logDebug
+	case "info":
+		return logInfo
+	case "error":
+		return logError
+	default:
+		return logWarn
+	}
+}
+
+func logf(level int, format string, args ...interface{}) {
+	if level <= logLevel {
+		log.Printf(format, args...)
+	}
+}
+
+// logRL is logf with per-category rate limiting for scanner-grade noise.
+var rlMu sync.Mutex
+var rlNext = map[string]time.Time{}
+var rlSupp = map[string]int{}
+
+func logRL(cat string, level int, every time.Duration, format string, args ...interface{}) {
+	if level > logLevel {
+		return
+	}
+	now := time.Now()
+	rlMu.Lock()
+	if next, ok := rlNext[cat]; ok && now.Before(next) {
+		rlSupp[cat]++
+		rlMu.Unlock()
+		return
+	}
+	rlNext[cat] = now.Add(every)
+	supp := rlSupp[cat]
+	rlSupp[cat] = 0
+	rlMu.Unlock()
+	if supp > 0 {
+		log.Printf("[%s] (+%d similar suppressed) "+format, append([]interface{}{supp}, args...)...)
+		return
+	}
+	log.Printf("["+cat+"] "+format, args...)
+}
+
+// ---------- counters + periodic stats (SPECTER_LOG=info to see) ----------
+var statsMu sync.Mutex
+var stats = map[string]uint64{}
+
+func statAdd(k string, n uint64) {
+	statsMu.Lock()
+	stats[k] += n
+	statsMu.Unlock()
+}
+
+func statInc(k string) { statAdd(k, 1) }
+
+var statsEvery = statsInterval()
+
+func statsInterval() time.Duration {
+	if v := os.Getenv("SPECTER_STATS_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 5 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 5 * time.Minute
+}
+
+func statReport() {
+	for range time.Tick(statsEvery) {
+		statsMu.Lock()
+		snapshot := make(map[string]uint64, len(stats))
+		for k, v := range stats {
+			snapshot[k] = v
+		}
+		statsMu.Unlock()
+		logf(logInfo, "stats tcp_accept=%d(drop=%d) tcp_hs_ok=%d tcp_hs_reject=%d tcp_dial_fail=%d tcp_dial_slow=%d udp_hello_ok=%d udp_hello_reject=%d udp_dial_fail=%d udp_dial_slow=%d udp_done=%d orphan_drained=%d orphan_expired=%d",
+			snapshot["tcp_accept"], snapshot["tcp_accept_drop"], snapshot["tcp_hs_ok"], snapshot["tcp_hs_reject"],
+			snapshot["tcp_dial_fail"], snapshot["tcp_dial_slow"], snapshot["udp_hello_ok"],
+			snapshot["udp_hello_reject"], snapshot["udp_dial_fail"], snapshot["udp_dial_slow"],
+			snapshot["udp_done"], snapshot["orphan_drained"], snapshot["orphan_expired"])
+	}
+}
+
+// dialTarget dials with timing: failures and slow (>2s) dials log at warn —
+// this is where user-visible -1s and spikes come from. kind is "tcp"/"udp".
+func dialTarget(kind, target string) (net.Conn, error) {
+	start := time.Now()
+	t, err := net.DialTimeout("tcp", target, dialTO)
+	dt := time.Since(start)
+	if err != nil {
+		statInc(kind + "_dial_fail")
+		logf(logWarn, "%s target dial fail target=%s err=%v", kind, target, err)
+		return nil, err
+	}
+	if dt > 2*time.Second {
+		statInc(kind + "_dial_slow")
+		logf(logWarn, "%s target dial slow target=%s took=%s", kind, target, dt.Round(time.Millisecond))
+	}
+	return t, nil
 }
 
 // ---------- DNS cache (browsing opens many conns to same hosts) ----------
@@ -410,12 +529,23 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 	defer c.Close()
 	defer func() { <-sem }()
 	tuneTCP(c)
+	statInc("tcp_accept")
+	remote := c.RemoteAddr().String()
 	hs := make([]byte, 69)
 	if _, err := io.ReadFull(c, hs); err != nil {
+		logRL("tcp-hs", logDebug, 5*time.Second, "hs read fail remote=%s err=%v", remote, err)
+		statInc("tcp_hs_reject")
 		return
 	}
 	nonce, ephC, ok := checkHandshake(hs)
-	if !ok || nonceSeen(nonce) {
+	if !ok {
+		logRL("tcp-hs", logDebug, 5*time.Second, "hs reject (bad ver/tag) remote=%s", remote)
+		statInc("tcp_hs_reject")
+		return
+	}
+	if nonceSeen(nonce) {
+		logRL("tcp-hs", logDebug, 5*time.Second, "hs replay remote=%s", remote)
+		statInc("tcp_hs_reject")
 		return
 	}
 	ephSPriv, ephSPub := genEphemeral()
@@ -429,23 +559,27 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 	aead0, _ := chacha20poly1305.New(sk0)
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := c.Write(serverReply(ephSPub, ephC, nonce)); err != nil {
+		logRL("tcp-hs", logDebug, 5*time.Second, "hs reply write fail remote=%s err=%v", remote, err)
 		return
 	}
 	// first record carries the target under the hello key (0-RTT: the
 	// client sends hs+target together before seeing our reply)
 	tgt, err := readRecordFast(c, aead0)
 	if err != nil {
+		logf(logDebug, "tcp target record fail remote=%s err=%v", remote, err)
 		return
 	}
 	host, rest, ok := parseAddr(tgt)
 	if !ok || len(rest) < 2 {
+		logf(logDebug, "tcp bad target remote=%s", remote)
 		return
 	}
 	target := resolveHost(host) + ":" + itoa(int(binary.BigEndian.Uint16(rest[:2])))
-	t, err := net.DialTimeout("tcp", target, dialTO)
+	t, err := dialTarget("tcp", target)
 	if err != nil {
 		return
 	}
+	statInc("tcp_hs_ok")
 	defer t.Close()
 	tuneTCP(t)
 	c.SetDeadline(time.Time{})
@@ -571,6 +705,10 @@ func drainOrphans(s *udpSession) {
 	list := orphans[string(s.sid)]
 	delete(orphans, string(s.sid))
 	orphanMu.Unlock()
+	if len(list) > 0 {
+		statAdd("orphan_drained", uint64(len(list)))
+		logf(logDebug, "orphan drain sid=%x n=%d", s.sid, len(list))
+	}
 	for _, o := range list {
 		if openDeliver(s, o.pkt) {
 			s.mu.Lock()
@@ -582,13 +720,19 @@ func drainOrphans(s *udpSession) {
 
 func sweepOrphans() {
 	now := time.Now()
+	var expired uint64
 	orphanMu.Lock()
 	for k, vv := range orphans {
 		if len(vv) == 0 || now.Sub(vv[0].at) > orphanTTL {
 			delete(orphans, k)
+			expired += uint64(len(vv))
 		}
 	}
 	orphanMu.Unlock()
+	if expired > 0 {
+		statAdd("orphan_expired", expired)
+		logf(logDebug, "orphan sweep expired=%d", expired)
+	}
 }
 
 func udpReaper() {
@@ -603,6 +747,7 @@ func udpReaper() {
 				s.target.Close()
 				delete(udpSessions, k)
 				delete(udpBySID, string(s.sid))
+				statInc("udp_done")
 			}
 		}
 		udpMu.Unlock()
@@ -756,6 +901,7 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s
 		s.target.SetDeadline(time.Now().Add(3 * time.Minute))
 		n, err := s.target.Read(buf)
 		if err != nil || n == 0 {
+			logf(logDebug, "udp pump end sid=%x err=%v", sid, err)
 			break
 		}
 		s.mu.Lock()
@@ -822,6 +968,7 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s
 	if cur, ok := udpSessions[key]; ok && cur == s {
 		delete(udpSessions, key)
 		delete(udpBySID, string(s.sid))
+		statInc("udp_done")
 	}
 	udpMu.Unlock()
 }
@@ -842,7 +989,11 @@ func deliverUDP(s *udpSession, seq uint32, data []byte) {
 	write := func(d []byte) bool {
 		s.target.SetDeadline(time.Now().Add(30 * time.Second))
 		_, err := s.target.Write(d)
-		return err == nil
+		if err != nil {
+			logf(logDebug, "udp deliver write fail sid=%x err=%v", s.sid, err)
+			return false
+		}
+		return true
 	}
 	if seq == s.expect {
 		if !write(data) {
@@ -916,6 +1067,7 @@ func helloReply(sid, ephS, ephC, nonce []byte, total int) []byte {
 
 func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	if !validClass(udpClasses, len(pkt)) {
+		logRL("udp", logDebug, 5*time.Second, "bad size %d from %s", len(pkt), addr)
 		return
 	}
 	// Data for known session: O(1) lookup, no linear scan, no sleep.
@@ -933,7 +1085,10 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 				s.mu.Lock()
 				sid, ephS, ephC, hsNonce := s.sid, s.ephS, s.ephC, s.hsNonce
 				s.mu.Unlock()
+				logf(logDebug, "udp hello retry from %s, resending reply", addr)
 				conn.WriteToUDP(helloReply(sid, ephS, ephC, hsNonce, udpClasses[0]), addr)
+			} else {
+				logRL("udp-data", logDebug, 5*time.Second, "open fail from %s", addr)
 			}
 			return
 		}
@@ -959,7 +1114,9 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	if !hmac.Equal(m.Sum(nil)[:16], pkt[53:69]) {
 		// Not a hello (bad tag). Could be data whose random sid starts
 		// with the version byte (1/256) — orphan it instead of dropping.
+		logRL("udp-hello", logDebug, 5*time.Second, "hello tag mismatch from %s", addr)
 		stashOrphan(pkt[:8], pkt, addr)
+		statInc("udp_hello_reject")
 		return
 	}
 	sid := append([]byte(nil), pkt[69:77]...)
@@ -970,10 +1127,12 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	}
 	if s := lookupSessionFast(sid); s != nil {
 		// hello retransmit (client missed our reply): resend it
+		logf(logDebug, "udp hello retry from %s, resending reply", addr)
 		conn.WriteToUDP(helloReply(s.sid, s.ephS, s.ephC, s.hsNonce, udpClasses[0]), addr)
 		return
 	}
 	if nonceSeen(hsNonce) {
+		logRL("udp-hello", logDebug, 5*time.Second, "hello dup from %s", addr)
 		return
 	}
 	sk0 := hsKey(hsNonce)
@@ -981,18 +1140,23 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	ad := append(append(append([]byte(nil), sid...), flags), pkt[77:81]...)
 	pt, err := a.Open(nil, hsNonce[:12], pkt[82:], ad)
 	if err != nil || len(pt) != budget {
+		logRL("udp-hello", logDebug, 5*time.Second, "hello open fail from %s err=%v", addr, err)
+		statInc("udp_hello_reject")
 		return
 	}
 	host, rest, ok := parseAddr(pt)
 	if !ok || len(rest) < 2 {
+		logRL("udp-hello", logDebug, 5*time.Second, "hello bad target from %s", addr)
+		statInc("udp_hello_reject")
 		return
 	}
 	_ = seq
 	target := resolveHost(host) + ":" + itoa(int(binary.BigEndian.Uint16(rest[:2])))
-	t, err := net.DialTimeout("tcp", target, dialTO)
+	t, err := dialTarget("udp", target)
 	if err != nil {
 		return
 	}
+	statInc("udp_hello_ok")
 	tuneTCP(t)
 	ephSPriv, ephSPub := genEphemeral()
 	shared, err := curve25519.X25519(ephSPriv, ephC)
@@ -1090,16 +1254,21 @@ func udpLoop(uconn *net.UDPConn) {
 
 func main() {
 	mode := os.Getenv("SPECTER_TRANSPORT") // tcp | udp | both (default both)
+	if mode != "tcp" && mode != "udp" && mode != "" && mode != "both" {
+		logf(logWarn, "unknown SPECTER_TRANSPORT=%q, serving tcp+udp", mode)
+	}
+	listen := listenAddr()
+	log.Printf("specter-server v3.3 listen=%s mode=%s log=%s", listen, mode, os.Getenv("SPECTER_LOG"))
 	var ln net.Listener
 	if mode != "udp" {
 		var err error
-		ln, err = net.Listen("tcp", listenAddr())
+		ln, err = net.Listen("tcp", listen)
 		if err != nil {
 			panic(err)
 		}
 	}
 	if mode != "tcp" {
-		uaddr, err := net.ResolveUDPAddr("udp", listenAddr())
+		uaddr, err := net.ResolveUDPAddr("udp", listen)
 		if err != nil {
 			panic(err)
 		}
@@ -1111,11 +1280,12 @@ func main() {
 		_ = uconn.SetWriteBuffer(4 << 20)
 		go udpLoop(uconn)
 	}
+	go nonceSweeper()
+	go udpReaper()
+	go statReport()
 	if ln == nil {
 		select {} // UDP-only mode: just wait
 	}
-	go nonceSweeper()
-	go udpReaper()
 	sem := make(chan struct{}, maxConns)
 	for {
 		c, err := ln.Accept()
@@ -1126,6 +1296,8 @@ func main() {
 		case sem <- struct{}{}:
 			go handleTCP(c, sem)
 		default:
+			logRL("tcp-conn", logWarn, 10*time.Second, "at maxConns=%d, dropping %s", maxConns, c.RemoteAddr())
+			statInc("tcp_accept_drop")
 			c.Close()
 		}
 	}
