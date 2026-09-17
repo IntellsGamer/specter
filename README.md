@@ -182,6 +182,35 @@ mode(s) it is started with: `SPECTER_TRANSPORT=tcp` → TCP only, anything
 else → TCP+UDP on the same port. **Both ends must agree** — a `udp` client
 against a TCP-only server stalls silently (by design).
 
+## Multiplexing (v3.4, TCP legs)
+
+One TCP trunk carries many SOCKS streams; the per-connection handshake
+happens once per trunk instead of once per tab.
+
+| Client `mux` | Server `SPECTER_MUX` | Result |
+|---|---|---|
+| `off` | either | Legacy single-stream (pre-mux behavior) |
+| `on` | `on` (default) | Mux trunk, fails closed otherwise |
+| `on` | `off` | Refused, client logs and fails the connection |
+| `on` | — | `transport=udp` refused: mux needs a TCP leg |
+| `auto` (default) | `on` | Trunk, transparent fallback to legacy |
+| `auto` | `off` / old server | Legacy single-stream |
+
+Negotiation is the handshake version byte (`0x03` legacy, `0x04` mux);
+crypto is identical, so old clients and `mux=off` work against new
+servers and vice versa. UDP legs stay single-stream. `SPECTER_MUX`
+overrides `config.json` on the client.
+
+## Reliability notes (v3.4, wire-compatible)
+
+- Target dials race all resolved addresses (250ms stagger, first wins),
+  fixing slow tails when the first address is dead. IPv6 dialing fixed
+  as a side effect (proper host:port joining).
+- UDP first flight is selectively acked: the server sends cumulative +
+  SACK ACKs (only to clients advertising support), the client resends
+  unacked leading datagrams for ~3s. Kills the hung-connection case on
+  slow dials, at no cost to old peers.
+
 ## Observability (v3.3+, wire unchanged — v3.3 servers work with v3.2 clients)
 
 Both binaries log to stderr. `SPECTER_LOG=error|warn|info|debug`

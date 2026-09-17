@@ -1,1 +1,1 @@
-{"server":"203.0.113.10","port":43117,"transport":"tcp","psk":"REPLACE_WITH_64_HEX_CHARS_FROM_SERVER"}
+{"server":"203.0.113.10","port":43117,"transport":"tcp","mux":"auto","psk":"REPLACE_WITH_64_HEX_CHARS_FROM_SERVER"}

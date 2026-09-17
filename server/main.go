@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -30,12 +31,13 @@ import (
 )
 
 const (
-	version   = 0x03 // wire protocol version (NOT the app release)
-	maxConns  = 1024
-	dialTO    = 10 * time.Second
-	nonceTTL  = 10 * time.Minute
-	udpIdle   = 120 * time.Second
-	udpGap    = 100 * time.Millisecond
+	version     = 0x03 // wire protocol version (NOT the app release)
+	muxVersion  = 0x04 // same wire, muxed streams (needs muxOn)
+	maxConns    = 1024
+	dialTO      = 10 * time.Second
+	nonceTTL    = 10 * time.Minute
+	udpIdle     = 120 * time.Second
+	udpGap      = 100 * time.Millisecond
 
 	udpMaxPayload = 1200
 
@@ -49,7 +51,7 @@ const (
 
 // appVersion is the release version. Bump this one place on release;
 // the wire version above only changes on protocol breaks.
-const appVersion = "v3.3.1"
+const appVersion = "v3.4.0"
 
 // Record size classes (totals on the wire). TCP records carry a 2-byte
 // length prefix; UDP sizes come from datagram boundaries.
@@ -179,23 +181,35 @@ func statReport() {
 			snapshot[k] = v
 		}
 		statsMu.Unlock()
-		logf(logInfo, "stats tcp_accept=%d(drop=%d) tcp_hs_ok=%d tcp_hs_reject=%d tcp_dial_fail=%d tcp_dial_slow=%d udp_hello_ok=%d udp_hello_reject=%d udp_dial_fail=%d udp_dial_slow=%d udp_done=%d orphan_drained=%d orphan_expired=%d",
+		logf(logInfo, "stats tcp_accept=%d(drop=%d) tcp_hs_ok=%d tcp_hs_reject=%d tcp_dial_fail=%d tcp_dial_slow=%d mux_dial_fail=%d mux_dial_slow=%d udp_hello_ok=%d udp_hello_reject=%d udp_dial_fail=%d udp_dial_slow=%d udp_done=%d orphan_drained=%d orphan_expired=%d",
 			snapshot["tcp_accept"], snapshot["tcp_accept_drop"], snapshot["tcp_hs_ok"], snapshot["tcp_hs_reject"],
-			snapshot["tcp_dial_fail"], snapshot["tcp_dial_slow"], snapshot["udp_hello_ok"],
+			snapshot["tcp_dial_fail"], snapshot["tcp_dial_slow"], snapshot["mux_dial_fail"], snapshot["mux_dial_slow"],
+			snapshot["udp_hello_ok"],
 			snapshot["udp_hello_reject"], snapshot["udp_dial_fail"], snapshot["udp_dial_slow"],
 			snapshot["udp_done"], snapshot["orphan_drained"], snapshot["orphan_expired"])
 	}
 }
 
-// dialTarget dials with timing: failures and slow (>2s) dials log at warn —
-// this is where user-visible -1s and spikes come from. kind is "tcp"/"udp".
-func dialTarget(kind, target string) (net.Conn, error) {
+// dialTarget dials host:port with Happy-Eyeballs-style racing across all
+// resolved addresses (250ms stagger, first success wins, overall dialTO).
+// Failures and slow (>2s) dials log at warn — this is where user-visible
+// -1s and spikes come from. kind is "tcp"/"udp" (the specter leg; the
+// target dial itself is always TCP).
+func dialTarget(kind, host, port string) (net.Conn, error) {
 	start := time.Now()
-	t, err := net.DialTimeout("tcp", target, dialTO)
+	target := net.JoinHostPort(host, port)
+	addrs := resolveHostList(host)
+	var t net.Conn
+	var err error
+	if len(addrs) < 2 {
+		t, err = net.DialTimeout("tcp", target, dialTO)
+	} else {
+		t, err = dialRace(addrs, port)
+	}
 	dt := time.Since(start)
 	if err != nil {
 		statInc(kind + "_dial_fail")
-		logf(logWarn, "%s target dial fail target=%s err=%v", kind, target, err)
+		logf(logWarn, "%s target dial fail target=%s addrs=%d err=%v", kind, target, len(addrs), err)
 		return nil, err
 	}
 	if dt > 2*time.Second {
@@ -205,27 +219,95 @@ func dialTarget(kind, target string) (net.Conn, error) {
 	return t, nil
 }
 
+// dialRace dials every address concurrently (RFC 8305-style 250ms stagger)
+// and returns the first success. Losers are cancelled and closed; no
+// goroutine or fd leaks: all sends land in the buffered channel, wg.Wait
+// bounds the cleanup, and only the winner escapes.
+func dialRace(addrs []string, port string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTO)
+	defer cancel()
+	type outcome struct {
+		c   net.Conn
+		err error
+	}
+	out := make(chan outcome, len(addrs))
+	var wg sync.WaitGroup
+	for i, a := range addrs {
+		wg.Add(1)
+		go func(i int, a string) {
+			defer wg.Done()
+			if i > 0 {
+				t := time.NewTimer(time.Duration(i) * 250 * time.Millisecond)
+				defer t.Stop()
+				select {
+				case <-ctx.Done():
+					out <- outcome{err: ctx.Err()}
+					return
+				case <-t.C:
+				}
+			}
+			d := net.Dialer{}
+			c, err := d.DialContext(ctx, "tcp", net.JoinHostPort(a, port))
+			out <- outcome{c, err}
+		}(i, a)
+	}
+	var firstErr error
+	for range addrs {
+		select {
+		case o := <-out:
+			if o.err == nil {
+				cancel()
+				wg.Wait()
+				close(out)
+				for o2 := range out {
+					if o2.c != nil && o2.c != o.c {
+						o2.c.Close()
+					}
+				}
+				return o.c, nil
+			}
+			if firstErr == nil {
+				firstErr = o.err
+			}
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			cancel()
+			wg.Wait()
+			return nil, firstErr
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no addresses")
+	}
+	return nil, firstErr
+}
+
 // ---------- DNS cache (browsing opens many conns to same hosts) ----------
+// Stores up to 4 addresses per host so dialTarget can race them.
 var dnsCache = struct {
 	sync.Mutex
-	m map[string]cachedIP
-}{m: map[string]cachedIP{}}
+	m map[string]cachedIPs
+}{m: map[string]cachedIPs{}}
 
-type cachedIP struct {
-	ip  string
+type cachedIPs struct {
+	ips []string
 	exp time.Time
 }
 
-func resolveHost(host string) string {
+const maxCachedIPs = 4
+
+func resolveHostList(host string) []string {
 	if ip := net.ParseIP(host); ip != nil {
-		return host
+		return []string{host}
 	}
 	now := time.Now()
 	dnsCache.Lock()
 	if e, ok := dnsCache.m[host]; ok && now.Before(e.exp) {
-		ip := e.ip
+		ips := e.ips
 		dnsCache.Unlock()
-		return ip
+		return ips
 	}
 	dnsCache.Unlock()
 	// Resolve outside lock (may block). Never pass nil ctx here: net's
@@ -234,18 +316,30 @@ func resolveHost(host string) string {
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(addrs) == 0 {
-		return host
+		return []string{host} // fallback: let the dialer report the error
 	}
-	ip := addrs[0].IP.String()
-	// Prefer IPv4 for dial speed when available.
+	ips := make([]string, 0, maxCachedIPs)
+	// IPv4 first: preserves legacy single-dial behavior for the common
+	// case (first dial usually wins instantly, backups only stagger in
+	// when it fails). The race, not the order, handles the rest.
 	for _, a := range addrs {
-		if a.IP.To4() != nil {
-			ip = a.IP.String()
+		if len(ips) >= maxCachedIPs {
 			break
+		}
+		if a.IP.To4() != nil {
+			ips = append(ips, a.IP.String())
+		}
+	}
+	for _, a := range addrs {
+		if len(ips) >= maxCachedIPs {
+			break
+		}
+		if a.IP.To4() == nil {
+			ips = append(ips, a.IP.String())
 		}
 	}
 	dnsCache.Lock()
-	dnsCache.m[host] = cachedIP{ip: ip, exp: now.Add(dnsCacheTTL)}
+	dnsCache.m[host] = cachedIPs{ips: ips, exp: now.Add(dnsCacheTTL)}
 	// opportunistic sweep
 	if len(dnsCache.m) > 10000 {
 		for k, v := range dnsCache.m {
@@ -255,7 +349,7 @@ func resolveHost(host string) string {
 		}
 	}
 	dnsCache.Unlock()
-	return ip
+	return ips
 }
 
 var psk = mustPSK()
@@ -503,9 +597,62 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// checkHandshake verifies ver + tag over ver||magic||nonce||ephC.
+// muxOn gates 0x04 sessions. SPECTER_MUX=off enforces legacy-only;
+// anything else (incl. unset) enables mux. No guard.sh change needed.
+var muxOn = func() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SPECTER_MUX")))
+	return v != "off"
+}()
+
+// ---------- mux frames (0x04 TCP sessions, one frame per record) ----------
+// header: sid u32be | flags u8 | dlen u16be. Trunk is a single ordered TCP
+// stream so frames never reorder; no per-stream sequence numbers needed.
+const (
+	muxFrameHdr = 7
+	muxSYN      = 0x01 // client->server open, data = target atyp+addr+port
+	muxDATA     = 0x02
+	muxFIN      = 0x04
+	muxRST      = 0x08
+	muxSYNACK   = 0x10 // server->client open-ok
+	muxSYNFAIL  = 0x20 // server->client open-failed
+
+	muxMaxStreams = 256
+	muxBufCap     = 8 << 20 // global queued-bytes backpressure threshold
+)
+
+func muxEncode(sid uint32, flags byte, data []byte) []byte {
+	f := make([]byte, muxFrameHdr+len(data))
+	binary.BigEndian.PutUint32(f[0:4], sid)
+	f[4] = flags
+	binary.BigEndian.PutUint16(f[5:7], uint16(len(data)))
+	copy(f[7:], data)
+	return f
+}
+
+func muxDecode(frame []byte) (sid uint32, flags byte, data []byte, ok bool) {
+	if len(frame) < muxFrameHdr {
+		return 0, 0, nil, false
+	}
+	ln := int(binary.BigEndian.Uint16(frame[5:7]))
+	if ln < 0 || muxFrameHdr+ln != len(frame) {
+		return 0, 0, nil, false
+	}
+	return binary.BigEndian.Uint32(frame[0:4]), frame[4], frame[7 : 7+ln], true
+}
+
+func closeWrite(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+		return
+	}
+	_ = c.Close()
+}
+
+// checkHandshake verifies tag over ver||magic||nonce||ephC for either
+// wire version. Version POLICY is enforced by the caller after HMAC so
+// every rejection (bad tag, mux-off, unknown ver) looks identical: silent.
 func checkHandshake(hs []byte) (nonce, ephC []byte, ok bool) {
-	if len(hs) != 69 || hs[0] != version {
+	if len(hs) != 69 || (hs[0] != version && hs[0] != muxVersion) {
 		return nil, nil, false
 	}
 	m := hmac.New(sha256.New, psk)
@@ -516,14 +663,14 @@ func checkHandshake(hs []byte) (nonce, ephC []byte, ok bool) {
 	return append([]byte(nil), hs[5:21]...), append([]byte(nil), hs[21:53]...), true
 }
 
-func serverReply(ephS, ephC, nonce []byte) []byte {
+func serverReply(ver byte, ephS, ephC, nonce []byte) []byte {
 	m := hmac.New(sha256.New, psk)
-	m.Write([]byte{version})
+	m.Write([]byte{ver})
 	m.Write(ephS)
 	m.Write(ephC)
 	m.Write(nonce)
 	out := make([]byte, 0, 49)
-	out = append(out, version)
+	out = append(out, ver)
 	out = append(out, ephS...)
 	out = append(out, m.Sum(nil)[:16]...)
 	return out
@@ -552,6 +699,11 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 		statInc("tcp_hs_reject")
 		return
 	}
+	ver := hs[0]
+	if ver == muxVersion && !muxOn {
+		logRL("tcp-hs", logDebug, 5*time.Second, "mux refused (disabled) remote=%s", remote)
+		return // silent close, same as bad tag; client auto-falls-back
+	}
 	ephSPriv, ephSPub := genEphemeral()
 	shared, err := curve25519.X25519(ephSPriv, ephC)
 	if err != nil {
@@ -562,8 +714,13 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 	aead, _ := chacha20poly1305.New(sk)
 	aead0, _ := chacha20poly1305.New(sk0)
 	c.SetDeadline(time.Now().Add(15 * time.Second))
-	if _, err := c.Write(serverReply(ephSPub, ephC, nonce)); err != nil {
+	if _, err := c.Write(serverReply(ver, ephSPub, ephC, nonce)); err != nil {
 		logRL("tcp-hs", logDebug, 5*time.Second, "hs reply write fail remote=%s err=%v", remote, err)
+		return
+	}
+	if ver == muxVersion {
+		logf(logDebug, "mux trunk from %s", remote)
+		handleMux(c, aead)
 		return
 	}
 	// first record carries the target under the hello key (0-RTT: the
@@ -578,8 +735,7 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 		logf(logDebug, "tcp bad target remote=%s", remote)
 		return
 	}
-	target := resolveHost(host) + ":" + itoa(int(binary.BigEndian.Uint16(rest[:2])))
-	t, err := dialTarget("tcp", target)
+	t, err := dialTarget("tcp", host, itoa(int(binary.BigEndian.Uint16(rest[:2]))))
 	if err != nil {
 		return
 	}
@@ -630,7 +786,229 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 	<-done
 }
 
+// ---------- mux dispatcher (0x04 TCP sessions) ----------
+
+type muxServerStream struct {
+	id     uint32
+	target net.Conn
+	q      chan []byte // trunk -> target payloads; nil chunk = FIN
+	dead   chan struct{}
+}
+
+// handleMux takes over a verified 0x04 connection (sem released by caller
+// on return). One TCP trunk carries many streams; frames arrive in order.
+func handleMux(c net.Conn, aead cipher.AEAD) {
+	defer c.Close()
+	c.SetDeadline(time.Time{})
+	tuneTCP(c)
+	var mu sync.Mutex
+	streams := map[uint32]*muxServerStream{}
+	var wmu sync.Mutex
+	var sentBytes int
+	var buffered int64
+	remote := c.RemoteAddr().String()
+
+	// sendFrame writes one frame in one class-sized record.
+	sendFrame := func(sid uint32, flags byte, data []byte) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		total := pickClassLatency(tcpClasses, sentBytes)
+		sentBytes += len(data)
+		_, err := c.Write(sealRecordFast(aead, muxEncode(sid, flags, data), total))
+		return err
+	}
+	// writeData chunks an arbitrary payload into DATA frames.
+	writeData := func(sid uint32, data []byte) error {
+		for len(data) > 0 {
+			wmu.Lock()
+			total := pickClassLatency(tcpClasses, sentBytes)
+			n := total - 2 - 12 - 16 - 2 - muxFrameHdr
+			if n > len(data) {
+				n = len(data)
+			}
+			rec := sealRecordFast(aead, muxEncode(sid, muxDATA, data[:n]), total)
+			sentBytes += n
+			_, err := c.Write(rec)
+			wmu.Unlock()
+			if err != nil {
+				return err
+			}
+			data = data[n:]
+		}
+		return nil
+	}
+	killStream := func(sid uint32) {
+		mu.Lock()
+		st, ok := streams[sid]
+		if ok {
+			delete(streams, sid)
+		}
+		mu.Unlock()
+		if ok {
+			close(st.dead)
+			st.target.Close()
+		}
+	}
+	openStream := func(sid uint32, tgt []byte) {
+		mu.Lock()
+		n := len(streams)
+		mu.Unlock()
+		if n >= muxMaxStreams {
+			logRL("mux", logWarn, 10*time.Second, "stream cap %d, refusing sid=%d from %s", muxMaxStreams, sid, remote)
+			_ = sendFrame(sid, muxSYNFAIL, nil)
+			return
+		}
+		host, rest, ok := parseAddr(tgt)
+		if !ok || len(rest) != 2 {
+			_ = sendFrame(sid, muxSYNFAIL, nil)
+			return
+		}
+		t, err := dialTarget("mux", host, itoa(int(binary.BigEndian.Uint16(rest[:2]))))
+		if err != nil {
+			_ = sendFrame(sid, muxSYNFAIL, nil)
+			return
+		}
+		tuneTCP(t)
+		st := &muxServerStream{id: sid, target: t, q: make(chan []byte, 256), dead: make(chan struct{})}
+		mu.Lock()
+		if _, dup := streams[sid]; dup {
+			mu.Unlock()
+			t.Close()
+			return
+		}
+		streams[sid] = st
+		mu.Unlock()
+		if err := sendFrame(sid, muxSYNACK, nil); err != nil {
+			killStream(sid)
+			return
+		}
+		done := make(chan struct{}, 2)
+		go func() { // trunk -> target
+			defer func() { done <- struct{}{} }()
+			for {
+				select {
+				case chunk := <-st.q:
+					if chunk == nil {
+						closeWrite(t)
+						return
+					}
+					atomic.AddInt64(&buffered, -int64(len(chunk)))
+					t.SetDeadline(time.Now().Add(3 * time.Minute))
+					if _, err := t.Write(chunk); err != nil {
+						return
+					}
+				case <-st.dead:
+					return
+				}
+			}
+		}()
+		go func() { // target -> trunk
+			defer func() { done <- struct{}{} }()
+			buf := make([]byte, 1388)
+			for {
+				t.SetDeadline(time.Now().Add(3 * time.Minute))
+				n, err := t.Read(buf)
+				if err != nil || n == 0 {
+					return
+				}
+				if err := writeData(sid, buf[:n]); err != nil {
+					return
+				}
+			}
+		}()
+		go func() { // reaper: both directions done -> teardown
+			<-done
+			<-done
+			killStream(sid)
+		}()
+	}
+
+	for {
+		// Global backpressure: pause reading while queued bytes are high.
+		// Pumps always drain, so this cannot deadlock.
+		for atomic.LoadInt64(&buffered) > muxBufCap {
+			time.Sleep(5 * time.Millisecond)
+		}
+		c.SetDeadline(time.Now().Add(3 * time.Minute))
+		d, err := readRecordFast(c, aead)
+		if err != nil {
+			logf(logDebug, "mux trunk end remote=%s err=%v", remote, err)
+			break
+		}
+		sid, flags, data, ok := muxDecode(d)
+		if !ok {
+			logf(logDebug, "mux bad frame remote=%s", remote)
+			continue
+		}
+		switch {
+		case flags&muxSYN != 0:
+			openStream(sid, data)
+		case flags&(muxFIN|muxRST) != 0:
+			mu.Lock()
+			st, known := streams[sid]
+			mu.Unlock()
+			if known {
+				if len(data) > 0 {
+					atomic.AddInt64(&buffered, int64(len(data)))
+					select {
+					case st.q <- data:
+					case <-st.dead:
+						atomic.AddInt64(&buffered, -int64(len(data)))
+					}
+				}
+				if flags&muxFIN != 0 {
+					// Ordered trunk: all DATA precedes this FIN.
+					select {
+					case st.q <- nil:
+					case <-st.dead:
+					}
+				}
+				if flags&muxRST != 0 {
+					killStream(sid)
+				}
+			}
+		default: // DATA (possibly with stray bits)
+			mu.Lock()
+			st, known := streams[sid]
+			mu.Unlock()
+			if !known {
+				_ = sendFrame(sid, muxRST, nil)
+				continue
+			}
+			atomic.AddInt64(&buffered, int64(len(data)))
+			select {
+			case st.q <- data:
+			case <-st.dead:
+				atomic.AddInt64(&buffered, -int64(len(data)))
+			}
+		}
+	}
+	// Trunk dead: reset everything so clients retrunk on demand.
+	mu.Lock()
+	ids := make([]uint32, 0, len(streams))
+	for id := range streams {
+		ids = append(ids, id)
+	}
+	mu.Unlock()
+	for _, id := range ids {
+		killStream(id)
+	}
+	if len(ids) > 0 {
+		logf(logWarn, "mux trunk dead remote=%s reset=%d streams", remote, len(ids))
+	}
+}
+
 // ---------- UDP ----------
+
+// Datagram flag bits. 0x01/0x02 predate ACKs; 0x04 marks ACK-capable
+// clients, 0x08 marks server ACK datagrams (only sent when the session
+// advertised 0x04, so old clients never see them).
+const (
+	udpFlagHello  = 0x01
+	udpFlagEarly  = 0x02
+	udpFlagAckCap = 0x04
+	udpFlagAck    = 0x08
+)
 
 type udpSession struct {
 	target    net.Conn
@@ -644,6 +1022,8 @@ type udpSession struct {
 	aeadFS    cipher.AEAD
 	aead0     cipher.AEAD
 	peerReady bool   // client proved FS key (first sk datagram seen)
+	ackOK     bool   // client advertised ACK support (flag 0x04)
+	rxCount   uint64 // data datagrams received (ACK every 2nd + on gap)
 	ephS      []byte
 	ephC      []byte
 	hsNonce   []byte
@@ -1083,6 +1463,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 				s.mu.Lock()
 				s.peer = addr
 				s.mu.Unlock()
+				maybeAck(conn, s)
 				return
 			}
 			if pkt[0] == version {
@@ -1155,8 +1536,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 		return
 	}
 	_ = seq
-	target := resolveHost(host) + ":" + itoa(int(binary.BigEndian.Uint16(rest[:2])))
-	t, err := dialTarget("udp", target)
+	t, err := dialTarget("udp", host, itoa(int(binary.BigEndian.Uint16(rest[:2]))))
 	if err != nil {
 		return
 	}
@@ -1179,7 +1559,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	}
 	s := &udpSession{target: t, pending: map[uint32][]byte{}, last: time.Now(),
 		sk: append([]byte(nil), sk...), sk0: append([]byte(nil), sk0...),
-		aeadFS: aeadFS, aead0: aead0,
+		aeadFS: aeadFS, aead0: aead0, ackOK: flags&udpFlagAckCap != 0,
 		ephS: ephSPub, ephC: ephC, hsNonce: hsNonce, sid: sid, peer: addr}
 	udpSessions[key] = s
 	udpBySID[string(sid)] = s
@@ -1208,6 +1588,10 @@ func openDeliver(s *udpSession, pkt []byte) bool {
 			_ = flags
 			s.mu.Lock()
 			s.peerReady = true
+			if flags&udpFlagAckCap != 0 {
+				s.ackOK = true
+			}
+			s.rxCount++
 			s.mu.Unlock()
 			deliverUDP(s, seq, data)
 			return true
@@ -1215,6 +1599,12 @@ func openDeliver(s *udpSession, pkt []byte) bool {
 		if aead0 != nil {
 			if flags, seq, data, ok := openDgramFast(aead0, pkt[:8], pkt); ok {
 				_ = flags
+				s.mu.Lock()
+				if flags&udpFlagAckCap != 0 {
+					s.ackOK = true
+				}
+				s.rxCount++
+				s.mu.Unlock()
 				deliverUDP(s, seq, data)
 				return true
 			}
@@ -1241,6 +1631,66 @@ func openDeliver(s *udpSession, pkt []byte) bool {
 	return false
 }
 
+// maybeAck sends a selective ACK (cumulative + 32-bit SACK) for sessions
+// that advertised ACK support. Delayed-ACK policy: every 2nd datagram, or
+// immediately when a gap is visible (fast signal for the missing seq, like
+// TCP duplicate ACKs). Best-effort: loss of an ACK is harmless, the next
+// one supersedes it. Smallest size class; never sent to old clients.
+func maybeAck(conn *net.UDPConn, s *udpSession) {
+	s.mu.Lock()
+	if !s.ackOK {
+		s.mu.Unlock()
+		return
+	}
+	c := s.rxCount
+	gap := len(s.pending) > 0
+	if c%2 == 1 && !gap {
+		s.mu.Unlock()
+		return
+	}
+	cumul := s.expect - 1
+	var mask uint32
+	for i := 0; i < 32; i++ {
+		if _, ok := s.pending[cumul+1+uint32(i)]; ok {
+			mask |= 1 << uint(i)
+		}
+	}
+	aead := s.aeadFS
+	if !s.peerReady {
+		aead = s.aead0
+	}
+	if aead == nil {
+		s.mu.Unlock()
+		return
+	}
+	sid := append([]byte(nil), s.sid...)
+	peer := s.peer
+	s.mu.Unlock()
+	if peer == nil {
+		return
+	}
+	total := udpClasses[0]
+	budget := total - 25 - 16
+	tmp := make([]byte, 12+budget-2-8)
+	if _, err := rand.Read(tmp); err != nil {
+		return
+	}
+	pt := make([]byte, budget)
+	binary.BigEndian.PutUint16(pt[:2], 8)
+	binary.BigEndian.PutUint32(pt[2:6], cumul)
+	binary.BigEndian.PutUint32(pt[6:10], mask)
+	copy(pt[10:], tmp[12:])
+	ad := append(append(append([]byte(nil), sid...), udpFlagAck), uint32be(cumul)...)
+	ct := aead.Seal(nil, tmp[:12], pt, ad)
+	out := make([]byte, 0, total)
+	out = append(out, sid...)
+	out = append(out, tmp[:12]...)
+	out = append(out, udpFlagAck)
+	out = append(out, uint32be(cumul)...)
+	out = append(out, ct...)
+	conn.WriteToUDP(out, peer)
+}
+
 func udpLoop(uconn *net.UDPConn) {
 	buf := make([]byte, 2048)
 	for {
@@ -1262,7 +1712,11 @@ func main() {
 		logf(logWarn, "unknown SPECTER_TRANSPORT=%q, serving tcp+udp", mode)
 	}
 	listen := listenAddr()
-	log.Printf("specter-server %s listen=%s mode=%s log=%s", appVersion, listen, mode, os.Getenv("SPECTER_LOG"))
+	muxStr := "on"
+	if !muxOn {
+		muxStr = "off"
+	}
+	log.Printf("specter-server %s listen=%s mode=%s mux=%s log=%s", appVersion, listen, mode, muxStr, os.Getenv("SPECTER_LOG"))
 	var ln net.Listener
 	if mode != "udp" {
 		var err error

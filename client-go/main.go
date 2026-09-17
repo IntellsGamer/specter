@@ -5,12 +5,14 @@ package main
 // Env overrides: SPECTER_SERVER/PORT/PSK/TRANSPORT.
 
 import (
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -29,15 +32,38 @@ import (
 
 const (
 	version     = 0x03 // wire protocol version (NOT the app release)
+	muxVersion  = 0x04 // same wire, muxed streams (needs server muxOn)
 	socksListen = "127.0.0.1:10867"
 )
 
+// errMuxUnsupported signals a silent-close on a 0x04 handshake: the server
+// speaks legacy-only (old binary or SPECTER_MUX=off). Auto mode falls back
+// to a 0x03 handshake; mux=on fails closed.
+var errMuxUnsupported = errors.New("mux unsupported by server")
+
 // appVersion is the release version. Bump this one place on release;
 // the wire version above only changes on protocol breaks.
-const appVersion = "v3.3.1"
+const appVersion = "v3.4.0"
 
 var tcpClasses = []int{320, 576, 1024, 1420}
 var udpClasses = []int{576, 1024, 1280}
+
+// Datagram flag bits (mirror server). 0x04 advertises ACK support;
+// 0x08 marks server ACK datagrams (never sent by old servers).
+const (
+	udpFlagHello  = 0x01
+	udpFlagEarly  = 0x02
+	udpFlagAckCap = 0x04
+	udpFlagAck    = 0x08
+)
+
+// First-flight retransmit: how many leading datagrams we keep copies of,
+// resend interval, and give-up age (then inner TCP retransmits if needed).
+const (
+	flightTrackMax   = 16
+	flightResendEvery = 250 * time.Millisecond
+	flightGiveUpAfter = 3 * time.Second
+)
 
 func pickClass(classes []int) int {
 	var b [1]byte
@@ -144,9 +170,10 @@ type Config struct {
 	Port      int    `json:"port"`
 	Psk       string `json:"psk"`
 	Transport string `json:"transport"`
+	Mux       string `json:"mux"` // on | off | auto (default auto)
 }
 
-func loadConfig() (server string, port int, psk []byte, transport string) {
+func loadConfig() (server string, port int, psk []byte, transport, muxMode string) {
 	path := ""
 	if len(os.Args) > 1 && os.Args[1][0] != '-' {
 		path = os.Args[1]
@@ -176,6 +203,15 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 	if cfg.Transport != "tcp" && cfg.Transport != "udp" && cfg.Transport != "auto" {
 		log.Fatal(`transport must be "tcp", "udp" or "auto"`)
 	}
+	if v := os.Getenv("SPECTER_MUX"); v != "" {
+		cfg.Mux = v
+	}
+	if cfg.Mux == "" {
+		cfg.Mux = "auto"
+	}
+	if cfg.Mux != "on" && cfg.Mux != "off" && cfg.Mux != "auto" {
+		log.Fatal(`mux must be "on", "off" or "auto"`)
+	}
 	missing := cfg.Server == "" || cfg.Server == "YOUR_SERVER_IP" ||
 		cfg.Psk == "" || (len(cfg.Psk) >= 7 && cfg.Psk[:7] == "REPLACE")
 	if missing {
@@ -185,6 +221,7 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 					Server: "203.0.113.10", Port: 43117,
 					Psk:       "REPLACE_WITH_64_HEX_CHARS_FROM_SERVER",
 					Transport: "auto",
+					Mux:       "auto",
 				}, "", "  ")
 				_ = os.WriteFile(cfgPath, append(dummy, '\n'), 0600)
 			}
@@ -200,7 +237,7 @@ func loadConfig() (server string, port int, psk []byte, transport string) {
 	if err != nil || len(b) != 32 {
 		log.Fatal("psk must be 64 hex chars")
 	}
-	return cfg.Server, cfg.Port, b, cfg.Transport
+	return cfg.Server, cfg.Port, b, cfg.Transport, cfg.Mux
 }
 
 func fsKey(psk, shared []byte) []byte {
@@ -344,6 +381,48 @@ func readRecordFast(r io.Reader, aead interface {
 	return pt[2 : 2+ln], nil
 }
 
+// ---------- mux frames (0x04 TCP sessions, one frame per record) ----------
+const (
+	muxFrameHdr = 7
+	muxSYN      = 0x01 // client->server open, data = target atyp+addr+port
+	muxDATA     = 0x02
+	muxFIN      = 0x04
+	muxRST      = 0x08
+	muxSYNACK   = 0x10 // server->client open-ok
+	muxSYNFAIL  = 0x20 // server->client open-failed
+
+	muxMaxStreams = 1024 // local cap; server enforces its own 256
+	muxBufCap     = 8 << 20
+)
+
+func muxEncode(sid uint32, flags byte, data []byte) []byte {
+	f := make([]byte, muxFrameHdr+len(data))
+	binary.BigEndian.PutUint32(f[0:4], sid)
+	f[4] = flags
+	binary.BigEndian.PutUint16(f[5:7], uint16(len(data)))
+	copy(f[7:], data)
+	return f
+}
+
+func muxDecode(frame []byte) (sid uint32, flags byte, data []byte, ok bool) {
+	if len(frame) < muxFrameHdr {
+		return 0, 0, nil, false
+	}
+	ln := int(binary.BigEndian.Uint16(frame[5:7]))
+	if ln < 0 || muxFrameHdr+ln != len(frame) {
+		return 0, 0, nil, false
+	}
+	return binary.BigEndian.Uint32(frame[0:4]), frame[4], frame[7 : 7+ln], true
+}
+
+func closeWrite(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+		return
+	}
+	_ = c.Close()
+}
+
 // ---------- established sessions ----------
 
 type established struct {
@@ -355,14 +434,16 @@ type established struct {
 	sk0       []byte // udp hello key (kept for completeness)
 }
 
-// handshakeTCP performs hs + first record (target, sk0) in one flight,
-// verifies the reply, and returns a live session.
-func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []byte) (*established, error) {
+// handshakeTCP performs hs + optional first record (target, sk0) in one
+// flight, verifies the reply, and returns a live session. ver selects the
+// wire mode (0x03 legacy single-stream, 0x04 mux trunk); tgt==nil sends the
+// handshake alone (mux trunk creation, streams open later).
+func handshakeTCP(server string, port int, psk []byte, ver byte, tgt []byte) (*established, error) {
 	magic := randBytes(4)
 	nonce := randBytes(16)
 	ephPriv, ephPub := genEphemeral()
 	m := hmac.New(sha256.New, psk)
-	m.Write([]byte{version})
+	m.Write([]byte{ver})
 	m.Write(magic)
 	m.Write(nonce)
 	m.Write(ephPub)
@@ -375,15 +456,16 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	}
 	tuneTCP(up)
 	hs := make([]byte, 0, 69)
-	hs = append(hs, version)
+	hs = append(hs, ver)
 	hs = append(hs, magic...)
 	hs = append(hs, nonce...)
 	hs = append(hs, ephPub...)
 	hs = append(hs, tag...)
-	tgt := append([]byte{atyp}, addr...)
-	tgt = append(tgt, portb...)
-	// latency: smallest class for target (usually <100B) avoids 1KB pad on handshake
-	flight := append(hs, sealRecord(sk0, tgt, tcpClasses[0])...)
+	flight := hs
+	if tgt != nil {
+		// latency: smallest class for target (usually <100B) avoids 1KB pad on handshake
+		flight = append(hs, sealRecord(sk0, tgt, tcpClasses[0])...)
+	}
 	up.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := up.Write(flight); err != nil {
 		up.Close()
@@ -391,18 +473,26 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	}
 	rep := make([]byte, 49)
 	if _, err := io.ReadFull(up, rep); err != nil {
-		logf(logWarn, "tcp no server reply %s:%d err=%v (wrong PSK/port? server overloaded?)", server, port, err)
 		up.Close()
+		// Silent close before/at reply on a 0x04 handshake means the
+		// server speaks legacy-only (old binary or mux disabled).
+		if ver == muxVersion {
+			return nil, fmt.Errorf("mux handshake %s:%d: %w", server, port, errMuxUnsupported)
+		}
+		logf(logWarn, "tcp no server reply %s:%d err=%v (wrong PSK/port? server overloaded?)", server, port, err)
 		return nil, err
 	}
-	if rep[0] != version {
+	if rep[0] != ver {
 		up.Close()
+		if ver == muxVersion {
+			return nil, fmt.Errorf("mux handshake %s:%d: bad version: %w", server, port, errMuxUnsupported)
+		}
 		logf(logError, "tcp bad version from %s:%d (incompatible server?)", server, port)
 		return nil, fmt.Errorf("bad version")
 	}
 	ephS := rep[1:33]
 	m2 := hmac.New(sha256.New, psk)
-	m2.Write([]byte{version})
+	m2.Write([]byte{ver})
 	m2.Write(ephS)
 	m2.Write(ephPub)
 	m2.Write(nonce)
@@ -420,7 +510,7 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	return &established{transport: "tcp", up: up, sk: fsKey(psk, shared)}, nil
 }
 
-// handshakeTCPEarly overlaps browseresty with Specter RTT: it dials+sends the
+// handshakeTCPEarly overlaps browser I/O with Specter RTT: it dials+sends the
 // flight, immediately replies SOCKS success so the browser sends ClientHello
 // while we wait for the server reply. Browser bytes stay in kernel buffer
 // until relay starts. Saves ~1 RTT per connection.
@@ -546,6 +636,100 @@ func relayTCP(app net.Conn, e *established) {
 	<-done
 }
 
+// flightTracker keeps copies of the first flightTrackMax datagrams of a
+// UDP connection and resends the unacked ones until the server's selective
+// ACKs cover them (or they age out). Resends are bit-identical duplicates
+// (same nonce+plaintext), so they are cryptographically safe and the
+// server dedups them by sequence number.
+type flightTracker struct {
+	mu    sync.Mutex
+	pkts  map[uint32]trackedPkt
+	start time.Time
+}
+
+type trackedPkt struct {
+	dg   []byte
+	last time.Time
+}
+
+func newFlightTracker() *flightTracker {
+	return &flightTracker{pkts: map[uint32]trackedPkt{}, start: time.Now()}
+}
+
+func (f *flightTracker) track(seq uint32, dg []byte) {
+	if seq >= flightTrackMax {
+		return
+	}
+	f.mu.Lock()
+	if len(f.pkts) < flightTrackMax {
+		f.pkts[seq] = trackedPkt{dg: dg, last: time.Now()}
+	}
+	f.mu.Unlock()
+}
+
+// onAck marks everything cumulatively acked plus SACK bits as received.
+func (f *flightTracker) onAck(cumul uint32, mask uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for seq := range f.pkts {
+		if cumul-seq < 1<<31 {
+			delete(f.pkts, seq)
+			continue
+		}
+		if d := seq - (cumul + 1); d < 32 && mask&(1<<d) != 0 {
+			delete(f.pkts, seq)
+		}
+	}
+}
+
+// due returns copies needing resend: unacked, due interval elapsed, young.
+func (f *flightTracker) due(now time.Time) [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out [][]byte
+	for seq, tp := range f.pkts {
+		if now.Sub(f.start) > flightGiveUpAfter {
+			delete(f.pkts, seq)
+			continue
+		}
+		if now.Sub(tp.last) >= flightResendEvery {
+			tp.last = now
+			f.pkts[seq] = tp
+			out = append(out, tp.dg)
+		}
+	}
+	return out
+}
+
+func (f *flightTracker) empty() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pkts) == 0
+}
+
+// retransmitLoop resends unacked first-flight datagrams until done closes
+// (connection end) or everything is acked/expired.
+func retransmitLoop(us net.Conn, f *flightTracker, done <-chan struct{}) {
+	t := time.NewTicker(flightResendEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case now := <-t.C:
+			for _, dg := range f.due(now) {
+				us.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := us.Write(dg); err != nil {
+					return
+				}
+			}
+			if f.empty() && time.Since(f.start) > flightGiveUpAfter {
+				return
+			}
+		}
+	}
+}
+
 // sealDgram builds a class-sized data datagram.
 func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, total int) []byte {
 	budget := total - 25 - 16
@@ -648,7 +832,7 @@ func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []
 	a, _ := chacha20poly1305.New(sk0)
 	fad := make([]byte, 0, 13)
 	fad = append(fad, sid...)
-	fad = append(fad, 1)
+	fad = append(fad, udpFlagHello|udpFlagAckCap)
 	fad = append(fad, 0, 0, 0, 0)
 	fct := a.Seal(nil, hsNonce[:12], hpt, fad)
 	hello := make([]byte, 0, helloTotal)
@@ -658,7 +842,7 @@ func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []
 	hello = append(hello, ephPub...)
 	hello = append(hello, tag...)
 	hello = append(hello, sid...)
-	hello = append(hello, 0, 0, 0, 0, 1)
+	hello = append(hello, 0, 0, 0, 0, udpFlagHello|udpFlagAckCap)
 	hello = append(hello, fct...)
 	deadline := time.Now().Add(helloTimeout)
 	for {
@@ -712,6 +896,8 @@ func relayUDP(app net.Conn, e *established) {
 	// reply already verified during handshake, so sk is live.
 	aead, _ := chacha20poly1305.New(sk)
 	done := make(chan struct{})
+	flight := newFlightTracker()
+	go retransmitLoop(e.us, flight, done)
 	go func() {
 		defer close(done)
 		var seq uint32
@@ -731,7 +917,8 @@ func relayUDP(app net.Conn, e *established) {
 				if end > n {
 					end = n
 				}
-				dg := sealDgramFast(aead, sid, 0, seq, buf[off:end], total)
+				dg := sealDgramFast(aead, sid, udpFlagAckCap, seq, buf[off:end], total)
+				flight.track(seq, dg)
 				seq++
 				sent += end - off
 				e.us.SetWriteDeadline(time.Now().Add(30 * time.Second))
@@ -765,6 +952,13 @@ func relayUDP(app net.Conn, e *established) {
 		}
 		pt, err := a.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
 		if err != nil {
+			continue
+		}
+		if dg[20]&udpFlagAck != 0 {
+			// Server selective ACK, not stream data.
+			if len(pt) >= 10 {
+				flight.onAck(binary.BigEndian.Uint32(pt[2:6]), binary.BigEndian.Uint32(pt[6:10]))
+			}
 			continue
 		}
 		seq := binary.BigEndian.Uint32(dg[21:25])
@@ -847,7 +1041,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		return
 	}
 	a0, _ := chacha20poly1305.New(sk0)
-	fad := append(append(append([]byte(nil), sid...), 1), 0, 0, 0, 0)
+	fad := append(append(append([]byte(nil), sid...), udpFlagHello|udpFlagAckCap), 0, 0, 0, 0)
 	fct := a0.Seal(nil, hsNonce[:12], hpt, fad)
 	hello := make([]byte, 0, total)
 	hello = append(hello, version)
@@ -856,7 +1050,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 	hello = append(hello, ephPub...)
 	hello = append(hello, tag...)
 	hello = append(hello, sid...)
-	hello = append(hello, 0, 0, 0, 0, 1)
+	hello = append(hello, 0, 0, 0, 0, udpFlagHello|udpFlagAckCap)
 	hello = append(hello, fct...)
 	type keyState struct {
 		sync.Mutex
@@ -878,6 +1072,8 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		return
 	}
 	done := make(chan struct{})
+	flight := newFlightTracker()
+	go retransmitLoop(us, flight, done)
 	go func() {
 		defer close(done)
 		var seq uint32
@@ -902,9 +1098,11 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 				ks.Unlock()
 				var fl byte
 				if early {
-					fl = 2
+					fl = udpFlagEarly
 				}
+				fl |= udpFlagAckCap
 				dg := sealDgramFast(aead, sid, fl, seq, buf[off:end], total)
+				flight.track(seq, dg)
 				seq++
 				sent += end - off
 				us.SetWriteDeadline(time.Now().Add(30 * time.Second))
@@ -980,6 +1178,13 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		if err != nil {
 			continue
 		}
+		if dg[20]&udpFlagAck != 0 {
+			// Server selective ACK, not stream data.
+			if len(pt) >= 10 {
+				flight.onAck(binary.BigEndian.Uint32(pt[2:6]), binary.BigEndian.Uint32(pt[6:10]))
+			}
+			continue
+		}
 		seq := binary.BigEndian.Uint32(dg[21:25])
 		ln := int(binary.BigEndian.Uint16(pt[:2]))
 		budget := len(dg) - 25 - 16
@@ -1035,7 +1240,9 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 	tcpCh := make(chan result, 1)
 	udpCh := make(chan result, 1)
 	go func() {
-		es, err := handshakeTCP(server, port, psk, atyp, addr, portb)
+		tgt := append([]byte{atyp}, addr...)
+		tgt = append(tgt, portb...)
+		es, err := handshakeTCP(server, port, psk, version, tgt)
 		tcpCh <- result{es, err}
 	}()
 	go func() {
@@ -1096,6 +1303,305 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 	return nil
 }
 
+// ---------- mux trunk (0x04 TCP sessions, client side) ----------
+
+type muxStream struct {
+	id   uint32
+	app  net.Conn
+	q    chan []byte // trunk -> app payloads; nil chunk = FIN
+	dead chan struct{}
+	done chan struct{} // closed when the stream fully tore down
+}
+
+type muxTrunk struct {
+	key      string
+	conn     net.Conn
+	aead     cipher.AEAD
+	mu       sync.Mutex
+	streams  map[uint32]*muxStream
+	nextID   uint32
+	dead     bool
+	wmu      sync.Mutex
+	sent     int
+	buffered int64
+}
+
+var trunkMu sync.Mutex
+var trunks = map[string]*muxTrunk{}
+
+type muxCapEntry struct {
+	ok  bool
+	exp time.Time
+}
+
+var muxCapMu sync.Mutex
+var muxCapCache = map[string]muxCapEntry{}
+const muxCapTTL = 5 * time.Minute
+
+func muxServerKey(server string, port int) string {
+	return fmt.Sprintf("%s:%d", server, port)
+}
+
+func getMuxCap(key string) (ok, fresh bool) {
+	muxCapMu.Lock()
+	defer muxCapMu.Unlock()
+	e, hit := muxCapCache[key]
+	if !hit || time.Now().After(e.exp) {
+		return false, false
+	}
+	return e.ok, true
+}
+
+func setMuxCap(key string, ok bool) {
+	muxCapMu.Lock()
+	muxCapCache[key] = muxCapEntry{ok: ok, exp: time.Now().Add(muxCapTTL)}
+	muxCapMu.Unlock()
+}
+
+// ensureMuxTrunk returns the shared trunk for server:port, dialing a 0x04
+// handshake if needed. Concurrent callers share the winner; the loser closes
+// its fresh conn. errMuxUnsupported (wrapped) when the server speaks legacy.
+func ensureMuxTrunk(server string, port int, psk []byte) (*muxTrunk, error) {
+	key := muxServerKey(server, port)
+	trunkMu.Lock()
+	if t, ok := trunks[key]; ok && !t.isDead() {
+		trunkMu.Unlock()
+		return t, nil
+	}
+	trunkMu.Unlock()
+	if ok, fresh := getMuxCap(key); fresh && !ok {
+		return nil, fmt.Errorf("mux %s: %w", key, errMuxUnsupported)
+	}
+	es, err := handshakeTCP(server, port, psk, muxVersion, nil)
+	if err != nil {
+		if errors.Is(err, errMuxUnsupported) {
+			setMuxCap(key, false)
+		}
+		return nil, err
+	}
+	aead, _ := chacha20poly1305.New(es.sk)
+	t := &muxTrunk{key: key, conn: es.up, aead: aead, streams: map[uint32]*muxStream{}, nextID: 1}
+	trunkMu.Lock()
+	if cur, ok := trunks[key]; ok && !cur.isDead() {
+		trunkMu.Unlock()
+		es.up.Close()
+		return cur, nil
+	}
+	trunks[key] = t
+	trunkMu.Unlock()
+	go t.readLoop()
+	return t, nil
+}
+
+func (t *muxTrunk) isDead() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.dead
+}
+
+func (t *muxTrunk) sendFrame(sid uint32, flags byte, data []byte) error {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	total := pickClassLatency(tcpClasses, t.sent)
+	t.sent += len(data)
+	_, err := t.conn.Write(sealRecordFast(t.aead, muxEncode(sid, flags, data), total))
+	return err
+}
+
+func (t *muxTrunk) writeData(sid uint32, data []byte) error {
+	for len(data) > 0 {
+		t.wmu.Lock()
+		total := pickClassLatency(tcpClasses, t.sent)
+		n := total - 2 - 12 - 16 - 2 - muxFrameHdr
+		if n > len(data) {
+			n = len(data)
+		}
+		rec := sealRecordFast(t.aead, muxEncode(sid, muxDATA, data[:n]), total)
+		t.sent += n
+		_, err := t.conn.Write(rec)
+		t.wmu.Unlock()
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func (t *muxTrunk) killStream(id uint32) {
+	t.mu.Lock()
+	st, ok := t.streams[id]
+	if ok {
+		delete(t.streams, id)
+	}
+	t.mu.Unlock()
+	if ok {
+		close(st.dead)
+		st.app.Close()
+		close(st.done)
+	}
+}
+
+// openStream SYNs a stream and pumps until it ends (mirrors relayTCP's
+// blocking contract so handle's deferred app.Close runs at the right time).
+// The caller writes the SOCKS reply after nil error.
+func (t *muxTrunk) openStream(app net.Conn, atyp byte, addr, portb []byte) error {
+	t.mu.Lock()
+	if t.dead {
+		t.mu.Unlock()
+		return fmt.Errorf("trunk dead")
+	}
+	if len(t.streams) >= muxMaxStreams {
+		t.mu.Unlock()
+		return fmt.Errorf("too many streams")
+	}
+	id := t.nextID
+	t.nextID++
+	if t.nextID == 0 {
+		t.nextID = 1 // wrap guard; live streams hold old IDs briefly
+	}
+	st := &muxStream{id: id, app: app, q: make(chan []byte, 256), dead: make(chan struct{}), done: make(chan struct{})}
+	t.streams[id] = st
+	t.mu.Unlock()
+	tgt := append([]byte{atyp}, addr...)
+	tgt = append(tgt, portb...)
+	if err := t.sendFrame(id, muxSYN, tgt); err != nil {
+		t.killStream(id)
+		<-st.done
+		return err
+	}
+	finisher := make(chan struct{}, 2)
+	go func() { // app -> trunk
+		defer func() { finisher <- struct{}{} }()
+		buf := make([]byte, 1388)
+		for {
+			app.SetDeadline(time.Now().Add(3 * time.Minute))
+			n, err := app.Read(buf)
+			if n > 0 {
+				if werr := t.writeData(id, buf[:n]); werr != nil {
+					_ = t.sendFrame(id, muxRST, nil)
+					return
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					_ = t.sendFrame(id, muxFIN, nil)
+				} else {
+					_ = t.sendFrame(id, muxRST, nil)
+				}
+				return
+			}
+		}
+	}()
+	go func() { // trunk -> app
+		defer func() { finisher <- struct{}{} }()
+		for {
+			select {
+			case chunk := <-st.q:
+				if chunk == nil {
+					closeWrite(app)
+					return
+				}
+				atomic.AddInt64(&t.buffered, -int64(len(chunk)))
+				app.SetDeadline(time.Now().Add(3 * time.Minute))
+				if _, err := app.Write(chunk); err != nil {
+					return
+				}
+			case <-st.dead:
+				return
+			}
+		}
+	}()
+	go func() { // reaper
+		<-finisher
+		<-finisher
+		t.killStream(id)
+	}()
+	<-st.done
+	return nil
+}
+
+func (t *muxTrunk) enqueue(sid uint32, chunk []byte) {
+	t.mu.Lock()
+	st, known := t.streams[sid]
+	t.mu.Unlock()
+	if !known {
+		return
+	}
+	if chunk == nil {
+		select {
+		case st.q <- nil:
+		case <-st.dead:
+		}
+		return
+	}
+	atomic.AddInt64(&t.buffered, int64(len(chunk)))
+	select {
+	case st.q <- chunk:
+	case <-st.dead:
+		atomic.AddInt64(&t.buffered, -int64(len(chunk)))
+	}
+}
+
+func (t *muxTrunk) readLoop() {
+	defer t.kill()
+	for {
+		for atomic.LoadInt64(&t.buffered) > muxBufCap {
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.conn.SetDeadline(time.Now().Add(3 * time.Minute))
+		d, err := readRecordFast(t.conn, t.aead)
+		if err != nil {
+			logf(logDebug, "mux trunk read end err=%v", err)
+			return
+		}
+		sid, flags, data, ok := muxDecode(d)
+		if !ok {
+			logf(logDebug, "mux bad frame")
+			continue
+		}
+		switch {
+		case flags&muxSYNFAIL != 0 || flags&muxRST != 0:
+			t.killStream(sid)
+		case flags&muxFIN != 0:
+			if len(data) > 0 {
+				t.enqueue(sid, data)
+			}
+			t.enqueue(sid, nil)
+		default:
+			t.enqueue(sid, data)
+		}
+	}
+}
+
+// kill resets the trunk: streams die (app conns close, browsers retry and
+// retrunk on demand) and the manager forgets it.
+func (t *muxTrunk) kill() {
+	t.mu.Lock()
+	if t.dead {
+		t.mu.Unlock()
+		return
+	}
+	t.dead = true
+	ids := make([]uint32, 0, len(t.streams))
+	for id := range t.streams {
+		ids = append(ids, id)
+	}
+	t.mu.Unlock()
+	for _, id := range ids {
+		t.killStream(id)
+	}
+	trunkMu.Lock()
+	if cur, ok := trunks[t.key]; ok && cur == t {
+		delete(trunks, t.key)
+	}
+	trunkMu.Unlock()
+	t.conn.Close()
+	if len(ids) > 0 {
+		logf(logWarn, "mux trunk dead, reset %d streams", len(ids))
+	}
+}
+
 // ---------- SOCKS front ----------
 
 func readN(c net.Conn, n int) ([]byte, error) {
@@ -1127,7 +1633,7 @@ func socksTarget(atyp byte, addr, portb []byte) string {
 	return fmt.Sprintf("atyp=%d:%d", atyp, port)
 }
 
-func handle(app net.Conn, server string, port int, psk []byte, transport string) {
+func handle(app net.Conn, server string, port int, psk []byte, transport, muxMode string) {
 	defer app.Close()
 	ver, err := readN(app, 1)
 	if err != nil || ver[0] != 5 {
@@ -1192,6 +1698,76 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	}
 	// Access log, always on (console): who asked for what.
 	log.Printf("from %s accepted //%s [socks -> proxy]", app.RemoteAddr(), socksTarget(atyp, addr, portb))
+	handleTransport(app, server, port, psk, transport, muxMode, atyp, addr, portb)
+}
+
+// socksSuccessReply is the 10-byte SOCKS5 connect-success. Written exactly
+// once per connection, by exactly one of the paths below.
+var socksSuccessReply = []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+
+// handleTransport picks mux trunk vs legacy single-stream:
+//
+//	mux=off                        -> legacy, exactly pre-mux behavior
+//	mux=on + tcp leg               -> mux trunk, fail closed
+//	mux=on + udp leg               -> refuse (mux needs a TCP leg)
+//	mux=auto + tcp                 -> trunk, fallback to legacy on reject
+//	mux=auto + udp                 -> legacy UDP (mux is TCP-only in v3.4)
+//	mux=auto + auto                -> trunk attempt, fallback to leg race
+func handleTransport(app net.Conn, server string, port int, psk []byte, transport, muxMode string, atyp byte, addr, portb []byte) {
+	if muxMode == "off" {
+		legacyHandle(app, server, port, psk, transport, atyp, addr, portb)
+		return
+	}
+	if transport == "udp" {
+		if muxMode == "on" {
+			logf(logError, "mux=on needs a TCP leg, transport=udp configured; refusing (use mux=off/auto for UDP)")
+			return
+		}
+		udpLegPinned(app, server, port, psk, atyp, addr, portb)
+		return
+	}
+	if transport == "tcp" {
+		if muxMode == "on" {
+			t, err := ensureMuxTrunk(server, port, psk)
+			if err != nil {
+				logf(logError, "mux trunk fail: %v", err)
+				return
+			}
+			if _, err := app.Write(socksSuccessReply); err != nil {
+				return
+			}
+			t.openStream(app, atyp, addr, portb)
+			return
+		}
+		if t, err := ensureMuxTrunk(server, port, psk); err == nil {
+			if _, err := app.Write(socksSuccessReply); err != nil {
+				return
+			}
+			t.openStream(app, atyp, addr, portb)
+			return
+		} else {
+			logf(logDebug, "mux unavailable (%v), legacy TCP", err)
+		}
+		legacyHandle(app, server, port, psk, transport, atyp, addr, portb)
+		return
+	}
+	// transport auto: trunk first (negative-cached on legacy servers so
+	// this costs one dial only until the cache expires), else leg race.
+	if t, err := ensureMuxTrunk(server, port, psk); err == nil {
+		setPinned("tcp")
+		if _, err := app.Write(socksSuccessReply); err != nil {
+			return
+		}
+		t.openStream(app, atyp, addr, portb)
+		return
+	} else {
+		logf(logDebug, "mux unavailable (%v), racing legs", err)
+	}
+	legacyHandle(app, server, port, psk, transport, atyp, addr, portb)
+}
+
+// legacyHandle is the pre-mux single-stream path (0x03 handshakes).
+func legacyHandle(app net.Conn, server string, port int, psk []byte, transport string, atyp byte, addr, portb []byte) {
 	switch transport {
 	case "tcp":
 		// Early SOCKS reply inside handshake overlaps browser TLS with Specter RTT.
@@ -1235,18 +1811,18 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	server, port, psk, transport := loadConfig()
+	server, port, psk, transport, muxMode := loadConfig()
 	ln, err := net.Listen("tcp", socksListen)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("specter-go %s client [%s] socks5 %s -> %s:%d", appVersion, transport, socksListen, server, port)
+	log.Printf("specter-go %s client [%s/mux=%s] socks5 %s -> %s:%d", appVersion, transport, muxMode, socksListen, server, port)
 	_ = psk
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			continue
 		}
-		go handle(c, server, port, psk, transport)
+		go handle(c, server, port, psk, transport, muxMode)
 	}
 }
