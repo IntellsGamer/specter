@@ -13,7 +13,6 @@ Run the client once and it writes a dummy `config.json` next to itself
 > **Warning:** Specter has real forward secrecy (X25519 + HKDF per
 > connection) and authenticated frames, but it is NOT independently audited.
 > Use WireGuard / Trojan for anything that needs a certified guarantee.
-> sensitive.
 
 ## Layout
 
