@@ -6,6 +6,7 @@ package main
 // NOT audited crypto.
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
@@ -104,8 +105,11 @@ func resolveHost(host string) string {
 		return ip
 	}
 	dnsCache.Unlock()
-	// Resolve outside lock (may block).
-	addrs, err := net.DefaultResolver.LookupIPAddr(nil, host)
+	// Resolve outside lock (may block). Never pass nil ctx here: net's
+	// lookup path dereferences it and panics (crashed v3.2.0 on domains).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(addrs) == 0 {
 		return host
 	}
