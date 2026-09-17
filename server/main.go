@@ -437,8 +437,45 @@ func openDgram(sk, sid []byte, pkt []byte) (flags byte, seq uint32, data []byte,
 	return flags, seq, pt[2 : 2+ln], true
 }
 
+// pacer smooths UDP bursts (token bucket) so big responses don't
+// overflow socket buffers and collapse into mass loss.
+type pacer struct {
+	mu     sync.Mutex
+	rate   float64
+	tokens float64
+	last   time.Time
+}
+
+func newPacer(bps float64) *pacer {
+	return &pacer{rate: bps, tokens: 65536, last: time.Now()}
+}
+
+func (p *pacer) wait(n int) {
+	p.mu.Lock()
+	now := time.Now()
+	p.tokens += now.Sub(p.last).Seconds() * p.rate
+	if p.tokens > 256*1024 {
+		p.tokens = 256 * 1024
+	}
+	p.last = now
+	need := float64(n)
+	if p.tokens >= need {
+		p.tokens -= need
+		p.mu.Unlock()
+		return
+	}
+	deficit := need - p.tokens
+	p.tokens = 0
+	p.mu.Unlock()
+	time.Sleep(time.Duration(deficit / p.rate * float64(time.Second)))
+	p.mu.Lock()
+	p.last = time.Now()
+	p.mu.Unlock()
+}
+
 func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s *udpSession) {
 	buf := make([]byte, udpMaxPayload)
+	pacer := newPacer(40 << 20) // ~40 Mbps smooths bursts past socket buffers
 	for {
 		s.target.SetDeadline(time.Now().Add(3 * time.Minute))
 		n, err := s.target.Read(buf)
@@ -482,6 +519,7 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s
 			out = append(out, uint32be(seq)...)
 			out = append(out, ct...)
 			conn.WriteToUDP(out, addr)
+			pacer.wait(len(out))
 			seq++
 			s.mu.Lock()
 			s.sendSeq = seq
@@ -733,6 +771,8 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+		_ = uconn.SetReadBuffer(4 << 20)
+		_ = uconn.SetWriteBuffer(4 << 20)
 		go udpLoop(uconn)
 	}
 	if ln == nil {

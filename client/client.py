@@ -390,6 +390,8 @@ def _valid_class(classes, total):
 def udp_handshake(atyp, addr, port):
     """Blocking hello + reply wait. Returns (us, sk, sid) or raises."""
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    us.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+    us.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
     us.settimeout(30)
     us.connect((SERVER, SPORT))
     magic = os.urandom(4)
@@ -436,6 +438,8 @@ def udp_leg(app, atyp, addr, port):
     """Pinned UDP with true 0-RTT: sender starts under sk0 immediately."""
     us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        us.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        us.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
         us.settimeout(30)
         us.connect((SERVER, SPORT))
     except OSError:

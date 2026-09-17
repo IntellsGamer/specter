@@ -343,12 +343,21 @@ func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, tota
 	return out
 }
 
+// tuneUDP raises socket buffers so bursts don't collapse into loss.
+func tuneUDP(c net.Conn) {
+	if u, ok := c.(*net.UDPConn); ok {
+		_ = u.SetReadBuffer(4 << 20)
+		_ = u.SetWriteBuffer(4 << 20)
+	}
+}
+
 // handshakeUDP performs hello + reply wait (retransmitting) and returns live session.
 func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []byte) (*established, error) {
 	us, err := net.DialTimeout("udp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	tuneUDP(us)
 	magic := randBytes(4)
 	hsNonce := randBytes(16)
 	ephPriv, ephPub := genEphemeral()
@@ -454,7 +463,7 @@ func relayUDP(app net.Conn, e *established) {
 				}
 				dg := sealDgram(sk, sid, randBytes(12), 0, seq, buf[off:end], total)
 				seq++
-				e.us.SetDeadline(time.Now().Add(30 * time.Second))
+				e.us.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				if _, err := e.us.Write(dg); err != nil {
 					return
 				}
@@ -473,7 +482,7 @@ func relayUDP(app net.Conn, e *established) {
 			return
 		default:
 		}
-		e.us.SetDeadline(time.Now().Add(3 * time.Minute))
+		e.us.SetReadDeadline(time.Now().Add(3 * time.Minute))
 		n, err := e.us.Read(rbuf)
 		if err != nil {
 			return
@@ -544,6 +553,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		return
 	}
 	defer us.Close()
+	tuneUDP(us)
 	magic := randBytes(4)
 	hsNonce := randBytes(16)
 	ephPriv, ephPub := genEphemeral()
@@ -585,51 +595,10 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 	if _, err := us.Write(hello); err != nil {
 		return
 	}
-	// hello retransmit until reply (or give up with sender running)
-	replyDone := make(chan struct{})
-	go func() {
-		defer close(replyDone)
-		deadline := time.Now().Add(8 * time.Second)
-		rep := make([]byte, 2048)
-		for {
-			us.SetDeadline(time.Now().Add(time.Second))
-			if _, err := us.Write(hello); err != nil {
-				return
-			}
-			us.SetDeadline(time.Now().Add(time.Second))
-			n, err := us.Read(rep)
-			if err != nil {
-				if time.Now().After(deadline) {
-					return
-				}
-				continue
-			}
-			// data datagram (server fast path)? stash check: must be reply-sized with tag
-			r := rep[:n]
-			if !validClass(udpClasses, len(r)) || string(r[:8]) != string(sid) {
-				continue
-			}
-			ephS := r[8:40]
-			m2 := hmac.New(sha256.New, psk)
-			m2.Write([]byte{version})
-			m2.Write(ephS)
-			m2.Write(ephPub)
-			m2.Write(hsNonce)
-			m2.Write(sid)
-			if !hmac.Equal(m2.Sum(nil)[:16], r[40:56]) {
-				continue
-			}
-			shared, err := curve25519.X25519(ephPriv, ephS)
-			if err != nil {
-				return
-			}
-			ks.Lock()
-			ks.sk = fsKey(psk, shared)
-			ks.early = false
-			ks.Unlock()
-			return
-		}
-	}()
+	// Single reader from here on: reply detection + data share this loop,
+	// so no datagram is ever stolen and deadlines never fight.
+	flipped := false
+	hsStart := time.Now()
 	if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}
@@ -661,7 +630,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 				}
 				dg := sealDgram(kk, sid, randBytes(12), fl, seq, buf[off:end], total)
 				seq++
-				us.SetDeadline(time.Now().Add(30 * time.Second))
+				us.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				if _, err := us.Write(dg); err != nil {
 					return
 				}
@@ -679,14 +648,46 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 			return
 		default:
 		}
-		us.SetDeadline(time.Now().Add(3 * time.Minute))
+		us.SetReadDeadline(time.Now().Add(time.Second))
 		n, err := us.Read(rbuf)
 		if err != nil {
-			return
+			if !flipped {
+				if time.Since(hsStart) > 8*time.Second {
+					return
+				}
+				us.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_, _ = us.Write(hello)
+				continue
+			}
+			continue
 		}
 		dg := rbuf[:n]
 		if !validClass(udpClasses, len(dg)) || string(dg[:8]) != string(sid) {
 			continue
+		}
+		if !flipped {
+			// try hello reply first
+			if len(dg) >= 56 {
+				ephS := dg[8:40]
+				m2 := hmac.New(sha256.New, psk)
+				m2.Write([]byte{version})
+				m2.Write(ephS)
+				m2.Write(ephPub)
+				m2.Write(hsNonce)
+				m2.Write(sid)
+				if hmac.Equal(m2.Sum(nil)[:16], dg[40:56]) {
+					shared, err := curve25519.X25519(ephPriv, ephS)
+					if err != nil {
+						return
+					}
+					ks.Lock()
+					ks.sk = fsKey(psk, shared)
+					ks.early = false
+					ks.Unlock()
+					flipped = true
+					continue
+				}
+			}
 		}
 		ks.Lock()
 		kk := ks.sk
