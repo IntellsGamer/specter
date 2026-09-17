@@ -187,6 +187,9 @@ against a TCP-only server stalls silently (by design).
 Both binaries log to stderr. `SPECTER_LOG=error|warn|info|debug`
 (default `warn`). Nothing secret (no keys) is ever logged.
 
+- Client access log (always on, console):
+  `from 127.0.0.1:21834 accepted //github.com:443 [socks -> proxy]`
+  — one line per SOCKS connection with source and target.
 - `warn` (default): target dial failures and slow dials (`>2s`) with the
   target host — this is where user-visible `-1`s and spikes come from;
   client handshake failures with hints (`wrong PSK?`, `UDP blocked?`);

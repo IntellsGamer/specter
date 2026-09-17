@@ -1,6 +1,6 @@
 package main
 
-// Specter v3.3 server: X25519 forward secrecy + HKDF session keys + AEAD cells.
+// Specter server: X25519 forward secrecy + HKDF session keys + AEAD cells.
 // Env: SPECTER_PSK (64 hex, required, long-term salt/auth only).
 //      SPECTER_LISTEN (default ":43117", TCP+UDP). SPECTER_TRANSPORT=tcp -> TCP only.
 // NOT audited crypto.
@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version   = 0x03
+	version   = 0x03 // wire protocol version (NOT the app release)
 	maxConns  = 1024
 	dialTO    = 10 * time.Second
 	nonceTTL  = 10 * time.Minute
@@ -46,6 +46,10 @@ const (
 	// DNS cache TTL for browsing fan-out to same domains.
 	dnsCacheTTL = 60 * time.Second
 )
+
+// appVersion is the release version. Bump this one place on release;
+// the wire version above only changes on protocol breaks.
+const appVersion = "v3.3.1"
 
 // Record size classes (totals on the wire). TCP records carry a 2-byte
 // length prefix; UDP sizes come from datagram boundaries.
@@ -1258,7 +1262,7 @@ func main() {
 		logf(logWarn, "unknown SPECTER_TRANSPORT=%q, serving tcp+udp", mode)
 	}
 	listen := listenAddr()
-	log.Printf("specter-server v3.3 listen=%s mode=%s log=%s", listen, mode, os.Getenv("SPECTER_LOG"))
+	log.Printf("specter-server %s listen=%s mode=%s log=%s", appVersion, listen, mode, os.Getenv("SPECTER_LOG"))
 	var ln net.Listener
 	if mode != "udp" {
 		var err error

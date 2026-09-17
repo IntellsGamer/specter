@@ -1,6 +1,6 @@
 package main
 
-// Specter v3.3 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+// Specter client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
 // Config: config.json (server/port/psk/transport tcp|udp|auto) or argv path.
 // Env overrides: SPECTER_SERVER/PORT/PSK/TRANSPORT.
 
@@ -28,9 +28,13 @@ import (
 )
 
 const (
-	version     = 0x03
+	version     = 0x03 // wire protocol version (NOT the app release)
 	socksListen = "127.0.0.1:10867"
 )
+
+// appVersion is the release version. Bump this one place on release;
+// the wire version above only changes on protocol breaks.
+const appVersion = "v3.3.1"
 
 var tcpClasses = []int{320, 576, 1024, 1420}
 var udpClasses = []int{576, 1024, 1280}
@@ -1100,6 +1104,29 @@ func readN(c net.Conn, n int) ([]byte, error) {
 	return b, err
 }
 
+// socksTarget renders atyp+addr+portb as host:port for the access log.
+func socksTarget(atyp byte, addr, portb []byte) string {
+	port := 0
+	if len(portb) == 2 {
+		port = int(binary.BigEndian.Uint16(portb))
+	}
+	switch atyp {
+	case 1:
+		if len(addr) == 4 {
+			return fmt.Sprintf("%s:%d", net.IP(addr).String(), port)
+		}
+	case 3:
+		if len(addr) > 1 && int(addr[0]) == len(addr)-1 {
+			return fmt.Sprintf("%s:%d", string(addr[1:]), port)
+		}
+	case 4:
+		if len(addr) == 16 {
+			return fmt.Sprintf("[%s]:%d", net.IP(addr).String(), port)
+		}
+	}
+	return fmt.Sprintf("atyp=%d:%d", atyp, port)
+}
+
 func handle(app net.Conn, server string, port int, psk []byte, transport string) {
 	defer app.Close()
 	ver, err := readN(app, 1)
@@ -1163,6 +1190,8 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	if err != nil {
 		return
 	}
+	// Access log, always on (console): who asked for what.
+	log.Printf("from %s accepted //%s [socks -> proxy]", app.RemoteAddr(), socksTarget(atyp, addr, portb))
 	switch transport {
 	case "tcp":
 		// Early SOCKS reply inside handshake overlaps browser TLS with Specter RTT.
@@ -1205,12 +1234,13 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	server, port, psk, transport := loadConfig()
 	ln, err := net.Listen("tcp", socksListen)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("specter-go v3.3 client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
+	log.Printf("specter-go %s client [%s] socks5 %s -> %s:%d", appVersion, transport, socksListen, server, port)
 	_ = psk
 	for {
 		c, err := ln.Accept()
