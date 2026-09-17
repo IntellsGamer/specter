@@ -522,6 +522,75 @@ var (
 	udpBySID = map[string]*udpSession{}
 )
 
+// Orphan early-data: datagrams arriving before their hello finished its
+// TCP dial (hello always loses the race — dial takes ms, packets take µs).
+// Old code slept 5x20ms here: every fresh connection paid +20ms jitter and
+// anything with dial >100ms lost its first data forever (no UDP retransmit
+// => hung connection). Instead park them with zero sleep and flush on
+// session insert. Bounded: 64/sid, 4096 sids, 2s expiry.
+type orphanPkt struct {
+	pkt  []byte
+	addr *net.UDPAddr
+	at   time.Time
+}
+
+var orphanMu sync.Mutex
+var orphans = map[string][]orphanPkt{}
+
+const (
+	orphanMaxPerSid = 64
+	orphanMaxSids   = 4096
+	orphanTTL       = 2 * time.Second
+)
+
+func stashOrphan(sid, pkt []byte, addr *net.UDPAddr) {
+	orphanMu.Lock()
+	defer orphanMu.Unlock()
+	k := string(sid)
+	if len(orphans) >= orphanMaxSids && orphans[k] == nil {
+		now := time.Now()
+		for kk, vv := range orphans {
+			if len(vv) == 0 || now.Sub(vv[0].at) > orphanTTL {
+				delete(orphans, kk)
+			}
+		}
+		if len(orphans) >= orphanMaxSids {
+			return // shed under flood
+		}
+	}
+	if len(orphans[k]) >= orphanMaxPerSid {
+		return
+	}
+	orphans[k] = append(orphans[k], orphanPkt{pkt: pkt, addr: addr, at: time.Now()})
+}
+
+// drainOrphans delivers parked early-data now that the session exists.
+// Must be called after the session is visible in udpBySID.
+func drainOrphans(s *udpSession) {
+	orphanMu.Lock()
+	list := orphans[string(s.sid)]
+	delete(orphans, string(s.sid))
+	orphanMu.Unlock()
+	for _, o := range list {
+		if openDeliver(s, o.pkt) {
+			s.mu.Lock()
+			s.peer = o.addr
+			s.mu.Unlock()
+		}
+	}
+}
+
+func sweepOrphans() {
+	now := time.Now()
+	orphanMu.Lock()
+	for k, vv := range orphans {
+		if len(vv) == 0 || now.Sub(vv[0].at) > orphanTTL {
+			delete(orphans, k)
+		}
+	}
+	orphanMu.Unlock()
+}
+
 func udpReaper() {
 	for range time.Tick(30 * time.Second) {
 		now := time.Now()
@@ -537,6 +606,7 @@ func udpReaper() {
 			}
 		}
 		udpMu.Unlock()
+		sweepOrphans()
 	}
 }
 
@@ -848,11 +918,9 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	if !validClass(udpClasses, len(pkt)) {
 		return
 	}
-	// Data for known session: O(1) lookup, no linear scan.
-	// Unknown sid + non-hello: likely 0-RTT early data racing hello creation
-	// (hello does TCP dial, ~ms). Wait briefly (5x20ms=100ms, half orig 200ms)
-	// for session to appear, then deliver. Dropping here is fatal (no UDP
-	// data retransmit), so grace is correctness, not just latency.
+	// Data for known session: O(1) lookup, no linear scan, no sleep.
+	// Unknown sid + non-hello: 0-RTT early data that beat its hello here
+	// (hello is still TCP-dialing). Park it; drainOrphans flushes on insert.
 	if len(pkt) >= 8 {
 		if s := lookupSessionFast(pkt[:8]); s != nil {
 			if openDeliver(s, pkt) {
@@ -870,17 +938,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 			return
 		}
 		if pkt[0] != version {
-			for i := 0; i < 5; i++ {
-				time.Sleep(20 * time.Millisecond)
-				if s := lookupSessionFast(pkt[:8]); s != nil {
-					if openDeliver(s, pkt) {
-						s.mu.Lock()
-						s.peer = addr
-						s.mu.Unlock()
-					}
-					return
-				}
-			}
+			stashOrphan(pkt[:8], pkt, addr)
 			return
 		}
 	}
@@ -899,6 +957,9 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	m := hmac.New(sha256.New, psk)
 	m.Write(pkt[:53])
 	if !hmac.Equal(m.Sum(nil)[:16], pkt[53:69]) {
+		// Not a hello (bad tag). Could be data whose random sid starts
+		// with the version byte (1/256) — orphan it instead of dropping.
+		stashOrphan(pkt[:8], pkt, addr)
 		return
 	}
 	sid := append([]byte(nil), pkt[69:77]...)
@@ -955,6 +1016,7 @@ func handleUDP(conn *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	udpSessions[key] = s
 	udpBySID[string(sid)] = s
 	udpMu.Unlock()
+	drainOrphans(s)
 	conn.WriteToUDP(helloReply(sid, ephSPub, ephC, hsNonce, udpClasses[0]), addr)
 	go udpPump(conn, key, addr, sid, s.sk, s)
 }
