@@ -1048,12 +1048,14 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 			tcpE = r.err
 			if r.err == nil {
 				setPinned("tcp")
+				// Reap the loser: its result channel is buffered (cap 1)
+				// so its handshake always completes without blocking;
+				// closing here just fails it fast. This goroutine touches
+				// no shared state — tcpRes/udpRes stay outer-only.
 				go func() {
-					u := <-udpCh
-					if u.err == nil && u.es != nil {
+					if u := <-udpCh; u.err == nil && u.es != nil {
 						u.es.us.Close()
 					}
-					udpRes = &u
 				}()
 				return r.es
 			}
@@ -1063,11 +1065,9 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 			if r.err == nil {
 				setPinned("udp")
 				go func() {
-					t := <-tcpCh
-					if t.err == nil && t.es != nil {
+					if t := <-tcpCh; t.err == nil && t.es != nil {
 						t.es.up.Close()
 					}
-					tcpRes = &t
 				}()
 				return r.es
 			}
@@ -1185,29 +1185,23 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 		}
 		// No pin yet (or pinned failed): optimistic early reply, then race.
 		// Browser pipelines ClientHello while race is in flight (kernel-buffered).
+		// Neither race leg nor relay writes a second SOCKS reply.
 		tuneTCP(app)
 		app.SetDeadline(time.Now().Add(3 * time.Minute))
 		if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
 			return
 		}
-		// Prevent double SOCKS reply: race winners must not write again.
-		// Temporarily wrap app so relay sees it as already-replied.
 		es := raceLegs(server, port, psk, atyp, addr, portb)
 		if es == nil {
 			return
 		}
+		// SOCKS success was already sent above; relay never writes it.
 		if es.transport == "tcp" {
-			relayTCPNoReply(app, es)
+			relayTCP(app, es)
 		} else {
 			relayUDP(app, es)
 		}
 	}
-}
-
-// relayTCPNoReply is relayTCP when SOCKS success was already sent early
-// (auto pinned-race path). Avoids writing the 10B reply twice.
-func relayTCPNoReply(app net.Conn, e *established) {
-	relayTCP(app, e)
 }
 
 func main() {

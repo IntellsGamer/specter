@@ -200,3 +200,16 @@ Both binaries log to stderr. `SPECTER_LOG=error|warn|info|debug`
   drains. Scanner/probe noise in these categories is rate-limited
   (1 line / 5 s + suppressed count), so the port still looks dead
   while you keep signal.
+
+## SOCKS reply semantics (read this if a client shows odd errors)
+
+For latency, the client answers SOCKS5 success **before** the Specter
+handshake to the server completes (TCP) or concurrently with it (auto
+race) — the browser pipelines its first bytes while the tunnel is still
+being established. Consequence: **SOCKS success means "accepted locally",
+not "tunnel is up".** If the handshake then fails (wrong PSK, server
+down, both transports lost), the connection is closed right after the
+success reply. Browsers absorb this as a reset and retry; scripted
+clients may surface it confusingly (`curl: (52) Empty reply`,
+`connection reset`) — check the client log (`SPECTER_LOG=warn` names the
+cause) rather than the exit code.
