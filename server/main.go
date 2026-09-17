@@ -51,7 +51,7 @@ const (
 
 // appVersion is the release version. Bump this one place on release;
 // the wire version above only changes on protocol breaks.
-const appVersion = "v3.4.0"
+const appVersion = "v3.5.0"
 
 // Record size classes (totals on the wire). TCP records carry a 2-byte
 // length prefix; UDP sizes come from datagram boundaries.
@@ -648,9 +648,18 @@ const (
 	muxRST      = 0x08
 	muxSYNACK   = 0x10 // server->client open-ok
 	muxSYNFAIL  = 0x20 // server->client open-failed
+	muxPING     = 0x40 // trunk control (sid 0), data = 8B nanotime
+	muxPONG     = 0x80 // trunk control (sid 0), echoes PING payload
 
 	muxMaxStreams = 256
 	muxBufCap     = 8 << 20 // global queued-bytes backpressure threshold
+
+	// Per-stream credit flow control: senders start with muxInitWin
+	// bytes and every receiver grants muxWinQuantum per 64KB consumed.
+	// A sender that never saw a WIN stays unlimited, so old peers (which
+	// never send WINs) behave exactly as before — no interop flag needed.
+	muxInitWin    = 1 << 20
+	muxWinQuantum = 64 << 10
 )
 
 func muxEncode(sid uint32, flags byte, data []byte) []byte {
@@ -822,10 +831,39 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 // ---------- mux dispatcher (0x04 TCP sessions) ----------
 
 type muxServerStream struct {
-	id     uint32
-	target net.Conn
-	q      chan []byte // trunk -> target payloads; nil chunk = FIN
-	dead   chan struct{}
+	id      uint32
+	target  net.Conn
+	q       chan []byte // trunk -> target payloads; nil chunk = FIN
+	dead    chan struct{}
+	sendWin int64       // remaining send credit (atomic; gated by gotWin)
+	gotWin  atomic.Bool // peer sent a WIN: flow control engaged
+}
+
+// waitWindow blocks until n bytes of send credit exist. Peers that never
+// sent a WIN stay unlimited (pre-flow-control behavior). Trunk is TCP so
+// granted WINs always arrive unless everything is dying anyway.
+func waitWindow(win *int64, gotWin *atomic.Bool, n int, dead <-chan struct{}) bool {
+	if !gotWin.Load() {
+		return true
+	}
+	for {
+		if atomic.LoadInt64(win) >= int64(n) {
+			return true
+		}
+		select {
+		case <-dead:
+			return false
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// winSid builds a WINDOW_UPDATE payload crediting one quantum to sid.
+// Sent as sid-0/flags-0 frame; harmless to peers that predate flow control.
+func winSid(sid uint32) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], sid)
+	return b[:]
 }
 
 // muxPending holds frames that arrived before their stream's async dial
@@ -891,6 +929,17 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 		if ok {
 			close(st.dead)
 			st.target.Close()
+		}
+	}
+	// creditWin applies one quantum of send credit from a WINDOW_UPDATE.
+	// Unknown sids (stale/duplicate) are ignored.
+	creditWin := func(sid uint32) {
+		mu.Lock()
+		st, ok := streams[sid]
+		mu.Unlock()
+		if ok {
+			st.gotWin.Store(true)
+			atomic.AddInt64(&st.sendWin, muxWinQuantum)
 		}
 	}
 	// feed enqueues one chunk (nil = FIN marker) to a live stream.
@@ -974,7 +1023,7 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 			var dup bool
 			if still && err == nil {
 				if _, dup = streams[sid]; !dup {
-					st = &muxServerStream{id: sid, target: t, q: make(chan []byte, 256), dead: make(chan struct{})}
+					st = &muxServerStream{id: sid, target: t, q: make(chan []byte, 256), dead: make(chan struct{}), sendWin: muxInitWin}
 					streams[sid] = st
 				}
 			}
@@ -1005,6 +1054,7 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 				feed(st, ch, false) // already counted at park time
 			}
 		done := make(chan struct{}, 2)
+		winAcc := 0
 		go func() { // trunk -> target
 			defer func() { done <- struct{}{} }()
 			for {
@@ -1018,6 +1068,12 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 					t.SetDeadline(time.Now().Add(3 * time.Minute))
 					if _, err := t.Write(chunk); err != nil {
 						return
+					}
+					// Grant the sender more credit as we consume.
+					winAcc += len(chunk)
+					if winAcc >= muxWinQuantum {
+						winAcc -= muxWinQuantum
+						_ = sendFrame(0, 0, winSid(sid))
 					}
 				case <-st.dead:
 					return
@@ -1033,9 +1089,13 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 				if err != nil || n == 0 {
 					return
 				}
+				if !waitWindow(&st.sendWin, &st.gotWin, n, st.dead) {
+					return
+				}
 				if err := writeData(sid, buf[:n]); err != nil {
 					return
 				}
+				atomic.AddInt64(&st.sendWin, -int64(n))
 			}
 		}()
 		go func() { // reaper: both directions done -> teardown
@@ -1061,6 +1121,18 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 		sid, flags, data, ok := muxDecode(d)
 		if !ok {
 			logf(logDebug, "mux bad frame remote=%s", remote)
+			continue
+		}
+		if sid == 0 {
+			// Trunk control, never a stream.
+			switch {
+			case flags&muxPING != 0 && len(data) == 8:
+				_ = sendFrame(0, muxPONG, append([]byte(nil), data...))
+			case flags == 0 && len(data) == 4:
+				creditWin(binary.BigEndian.Uint32(data))
+			default:
+				logf(logDebug, "mux control ignored flags=%02x remote=%s", flags, remote)
+			}
 			continue
 		}
 		switch {

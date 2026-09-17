@@ -43,7 +43,7 @@ var errMuxUnsupported = errors.New("mux unsupported by server")
 
 // appVersion is the release version. Bump this one place on release;
 // the wire version above only changes on protocol breaks.
-const appVersion = "v3.4.0"
+const appVersion = "v3.5.0"
 
 var tcpClasses = []int{320, 576, 1024, 1420}
 var udpClasses = []int{576, 1024, 1280}
@@ -390,9 +390,23 @@ const (
 	muxRST      = 0x08
 	muxSYNACK   = 0x10 // server->client open-ok
 	muxSYNFAIL  = 0x20 // server->client open-failed
+	muxPING     = 0x40 // trunk control (sid 0), data = 8B nanotime
+	muxPONG     = 0x80 // trunk control (sid 0), echoes PING payload
 
 	muxMaxStreams = 1024 // local cap; server enforces its own 256
 	muxBufCap     = 8 << 20
+
+	// Per-stream credit flow control, mirroring the server: senders
+	// start with muxInitWin and every receiver grants muxWinQuantum
+	// per 64KB consumed. Unlimited until the first WIN arrives, so old
+	// peers behave exactly as before.
+	muxInitWin    = 1 << 20
+	muxWinQuantum = 64 << 10
+
+	// Trunk keepalive: PING when idle this long (beats NAT timeouts);
+	// RTT summary logged every muxSummaryEvery.
+	muxKeepaliveEvery = 25 * time.Second
+	muxSummaryEvery   = 60 * time.Second
 )
 
 func muxEncode(sid uint32, flags byte, data []byte) []byte {
@@ -1306,11 +1320,13 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 // ---------- mux trunk (0x04 TCP sessions, client side) ----------
 
 type muxStream struct {
-	id   uint32
-	app  net.Conn
-	q    chan []byte // trunk -> app payloads; nil chunk = FIN
-	dead chan struct{}
-	done chan struct{} // closed when the stream fully tore down
+	id      uint32
+	app     net.Conn
+	q       chan []byte // trunk -> app payloads; nil chunk = FIN
+	dead    chan struct{}
+	done    chan struct{} // closed when the stream fully tore down
+	sendWin int64         // remaining send credit (atomic; gated by gotWin)
+	gotWin  atomic.Bool   // server sent a WIN: flow control engaged
 }
 
 type muxTrunk struct {
@@ -1324,6 +1340,37 @@ type muxTrunk struct {
 	wmu      sync.Mutex
 	sent     int
 	buffered int64
+	lastSend atomic.Int64 // unixnano of last frame sent (keepalive)
+	rttMu    sync.Mutex
+	rttEMA   time.Duration
+	rttMin   time.Duration
+	rttLast  time.Duration
+	rttN     uint64
+	rttAt    time.Time
+}
+
+// waitWindow blocks until n bytes of send credit exist. See server twin.
+func waitWindow(win *int64, gotWin *atomic.Bool, n int, dead <-chan struct{}) bool {
+	if !gotWin.Load() {
+		return true
+	}
+	for {
+		if atomic.LoadInt64(win) >= int64(n) {
+			return true
+		}
+		select {
+		case <-dead:
+			return false
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// winSid builds a WINDOW_UPDATE payload crediting one quantum to sid.
+func winSid(sid uint32) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], sid)
+	return b[:]
 }
 
 var trunkMu sync.Mutex
@@ -1389,7 +1436,9 @@ func ensureMuxTrunk(server string, port int, psk []byte) (*muxTrunk, error) {
 	}
 	trunks[key] = t
 	trunkMu.Unlock()
+	t.lastSend.Store(time.Now().UnixNano())
 	go t.readLoop()
+	go t.keepaliveLoop()
 	return t, nil
 }
 
@@ -1404,6 +1453,7 @@ func (t *muxTrunk) sendFrame(sid uint32, flags byte, data []byte) error {
 	defer t.wmu.Unlock()
 	total := pickClassLatency(tcpClasses, t.sent)
 	t.sent += len(data)
+	t.lastSend.Store(time.Now().UnixNano())
 	_, err := t.conn.Write(sealRecordFast(t.aead, muxEncode(sid, flags, data), total))
 	return err
 }
@@ -1418,6 +1468,7 @@ func (t *muxTrunk) writeData(sid uint32, data []byte) error {
 		}
 		rec := sealRecordFast(t.aead, muxEncode(sid, muxDATA, data[:n]), total)
 		t.sent += n
+		t.lastSend.Store(time.Now().UnixNano())
 		_, err := t.conn.Write(rec)
 		t.wmu.Unlock()
 		if err != nil {
@@ -1460,7 +1511,7 @@ func (t *muxTrunk) openStream(app net.Conn, atyp byte, addr, portb []byte) error
 	if t.nextID == 0 {
 		t.nextID = 1 // wrap guard; live streams hold old IDs briefly
 	}
-	st := &muxStream{id: id, app: app, q: make(chan []byte, 256), dead: make(chan struct{}), done: make(chan struct{})}
+	st := &muxStream{id: id, app: app, q: make(chan []byte, 256), dead: make(chan struct{}), done: make(chan struct{}), sendWin: muxInitWin}
 	t.streams[id] = st
 	t.mu.Unlock()
 	tgt := append([]byte{atyp}, addr...)
@@ -1478,10 +1529,14 @@ func (t *muxTrunk) openStream(app net.Conn, atyp byte, addr, portb []byte) error
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
 			if n > 0 {
+				if !waitWindow(&st.sendWin, &st.gotWin, n, st.dead) {
+					return
+				}
 				if werr := t.writeData(id, buf[:n]); werr != nil {
 					_ = t.sendFrame(id, muxRST, nil)
 					return
 				}
+				atomic.AddInt64(&st.sendWin, -int64(n))
 			}
 			if err != nil {
 				if err == io.EOF {
@@ -1495,6 +1550,7 @@ func (t *muxTrunk) openStream(app net.Conn, atyp byte, addr, portb []byte) error
 	}()
 	go func() { // trunk -> app
 		defer func() { finisher <- struct{}{} }()
+		winAcc := 0
 		for {
 			select {
 			case chunk := <-st.q:
@@ -1506,6 +1562,11 @@ func (t *muxTrunk) openStream(app net.Conn, atyp byte, addr, portb []byte) error
 				app.SetDeadline(time.Now().Add(3 * time.Minute))
 				if _, err := app.Write(chunk); err != nil {
 					return
+				}
+				winAcc += len(chunk)
+				if winAcc >= muxWinQuantum {
+					winAcc -= muxWinQuantum
+					_ = t.sendFrame(0, 0, winSid(id))
 				}
 			case <-st.dead:
 				return
@@ -1543,6 +1604,73 @@ func (t *muxTrunk) enqueue(sid uint32, chunk []byte) {
 	}
 }
 
+// creditWin applies one quantum of send credit from a WINDOW_UPDATE.
+func (t *muxTrunk) creditWin(sid uint32) {
+	t.mu.Lock()
+	st, ok := t.streams[sid]
+	t.mu.Unlock()
+	if ok {
+		st.gotWin.Store(true)
+		atomic.AddInt64(&st.sendWin, muxWinQuantum)
+	}
+}
+
+// fmtRTT renders sub-ms RTTs in micros so loopback/dev numbers stay useful.
+func fmtRTT(d time.Duration) string {
+	if d < time.Millisecond {
+		return fmt.Sprintf("%dµs", d.Microseconds())
+	}
+	return d.Round(time.Millisecond).String()
+}
+
+// sampleRTT folds a PONG measurement into the trunk stats.
+func (t *muxTrunk) sampleRTT(rtt time.Duration) {
+	t.rttMu.Lock()
+	defer t.rttMu.Unlock()
+	if t.rttN == 0 || rtt < t.rttMin {
+		t.rttMin = rtt
+	}
+	if t.rttN == 0 {
+		t.rttEMA = rtt
+	} else {
+		t.rttEMA = t.rttEMA*4/5 + rtt/5
+	}
+	t.rttLast = rtt
+	t.rttN++
+	t.rttAt = time.Now()
+	logf(logDebug, "mux trunk %s rtt=%s", t.key, fmtRTT(rtt))
+}
+
+// keepaliveLoop PINGs idle trunks (NAT survival) and logs an RTT summary.
+func (t *muxTrunk) keepaliveLoop() {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	lastSummary := time.Now()
+	for {
+		select {
+		case <-tick.C:
+			if t.isDead() {
+				return
+			}
+			now := time.Now()
+			if now.Sub(time.Unix(0, t.lastSend.Load())) > muxKeepaliveEvery {
+				var ts [8]byte
+				binary.BigEndian.PutUint64(ts[:], uint64(now.UnixNano()))
+				_ = t.sendFrame(0, muxPING, ts[:])
+			}
+			if now.Sub(lastSummary) >= muxSummaryEvery {
+				lastSummary = now
+				t.rttMu.Lock()
+				n, ema, min, last := t.rttN, t.rttEMA, t.rttMin, t.rttLast
+				t.rttMu.Unlock()
+				if n > 0 {
+					logf(logInfo, "mux trunk %s rtt last=%s ema=%s min=%s samples=%d", t.key, fmtRTT(last), fmtRTT(ema), fmtRTT(min), n)
+				}
+			}
+		}
+	}
+}
+
 func (t *muxTrunk) readLoop() {
 	defer t.kill()
 	for {
@@ -1558,6 +1686,23 @@ func (t *muxTrunk) readLoop() {
 		sid, flags, data, ok := muxDecode(d)
 		if !ok {
 			logf(logDebug, "mux bad frame")
+			continue
+		}
+		if sid == 0 {
+			// Trunk control, never a stream.
+			switch {
+			case flags&muxPONG != 0 && len(data) == 8:
+				sent := int64(binary.BigEndian.Uint64(data))
+				if rtt := time.Now().UnixNano() - sent; rtt > 0 && rtt < int64(time.Minute) {
+					t.sampleRTT(time.Duration(rtt))
+				}
+			case flags&muxPING != 0 && len(data) == 8:
+				_ = t.sendFrame(0, muxPONG, append([]byte(nil), data...))
+			case flags == 0 && len(data) == 4:
+				t.creditWin(binary.BigEndian.Uint32(data))
+			default:
+				logf(logDebug, "mux control ignored flags=%02x", flags)
+			}
 			continue
 		}
 		switch {
@@ -1598,7 +1743,14 @@ func (t *muxTrunk) kill() {
 	trunkMu.Unlock()
 	t.conn.Close()
 	if len(ids) > 0 {
-		logf(logWarn, "mux trunk dead, reset %d streams", len(ids))
+		t.rttMu.Lock()
+		last := t.rttLast
+		t.rttMu.Unlock()
+		if last > 0 {
+			logf(logWarn, "mux trunk dead, reset %d streams (last rtt=%s)", len(ids), fmtRTT(last))
+		} else {
+			logf(logWarn, "mux trunk dead, reset %d streams", len(ids))
+		}
 	}
 }
 

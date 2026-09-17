@@ -201,6 +201,16 @@ crypto is identical, so old clients and `mux=off` work against new
 servers and vice versa. UDP legs stay single-stream. `SPECTER_MUX`
 overrides `config.json` on the client.
 
+## Trunk health + flow control (v3.5, wire-compatible)
+
+- Idle trunks PING every 25s (NAT survival); PONGs feed a client-side
+  RTT tracker — per-minute `info` summary plus last-RTT on trunk death.
+  This is the permanent answer to "is it the proxy or the path".
+- Per-stream credit windows (1MB start, 64KB grants as the receiver
+  consumes) so one bulk download can't starve sibling streams. Grants
+  only engage after the first WINDOW_UPDATE, so old peers behave
+  exactly as before — no flag day.
+
 ## Reliability notes (v3.4, wire-compatible)
 
 - Target dials race all resolved addresses (250ms stagger, first wins),
