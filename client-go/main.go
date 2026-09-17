@@ -1,6 +1,6 @@
 package main
 
-// Specter v3.1 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
+// Specter v3.2 client (Go): SOCKS5 on 127.0.0.1:10867 -> Specter AEAD protocol.
 // Config: config.json (server/port/psk/transport tcp|udp|auto) or argv path.
 // Env overrides: SPECTER_SERVER/PORT/PSK/TRANSPORT.
 
@@ -49,6 +49,62 @@ func validClass(classes []int, total int) bool {
 		}
 	}
 	return false
+}
+
+// --- latency fixes ---
+
+const (
+	// First N bytes of a connection use the smallest class to minimise
+	// padding-on-wire and time-to-first-byte. After that, randomise for
+	// obfuscation as before.
+	earlyBytesThreshold = 4096
+	// Out-of-order gap skip: 100ms instead of 300ms. Single loss must not
+	// stall a TLS handshake for a third of a second.
+	udpGapFast = 100 * time.Millisecond
+	// Hello retransmit interval: 150ms instead of 1s.
+	helloRetryInterval = 150 * time.Millisecond
+	helloTimeout       = 8 * time.Second
+	// Transport pinning: race once, reuse winner for 5min.
+	pinTTL = 5 * time.Minute
+)
+
+func tuneTCP(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+}
+
+// pickClassLatency returns the smallest class for the first earlyBytesThreshold
+// bytes (TTFB-sensitive TLS/DNS/small HTTP), then random as before.
+func pickClassLatency(classes []int, bytesSent int) int {
+	if bytesSent < earlyBytesThreshold {
+		return classes[0]
+	}
+	return pickClass(classes)
+}
+
+var pinned = struct {
+	sync.Mutex
+	transport string
+	expires   time.Time
+}{}
+
+func getPinned() string {
+	pinned.Lock()
+	defer pinned.Unlock()
+	if time.Now().Before(pinned.expires) && pinned.transport != "" {
+		return pinned.transport
+	}
+	return ""
+}
+
+func setPinned(t string) {
+	pinned.Lock()
+	pinned.transport = t
+	pinned.expires = time.Now().Add(pinTTL)
+	pinned.Unlock()
 }
 
 type Config struct {
@@ -200,6 +256,62 @@ func readRecord(r io.Reader, sk []byte) ([]byte, error) {
 	return pt[2 : 2+ln], nil
 }
 
+// sealRecordFast reuses the per-connection AEAD and does a single rand.Read
+// for nonce+pad instead of two syscalls.
+func sealRecordFast(aead interface {
+	Seal(dst, nonce, plaintext, additionalData []byte) []byte
+}, data []byte, total int) []byte {
+	budget := total - 2 - 12 - 16
+	if len(data) > budget-2 {
+		data = data[:budget-2]
+	}
+	padLen := budget - 2 - len(data)
+	// one CSPRNG read for nonce (12) + pad
+	tmp := make([]byte, 12+padLen)
+	if _, err := rand.Read(tmp); err != nil {
+		panic(err)
+	}
+	rnonce := tmp[:12]
+	pt := make([]byte, budget)
+	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
+	copy(pt[2:], data)
+	copy(pt[2+len(data):], tmp[12:])
+	out := make([]byte, 0, total)
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(total-2))
+	out = append(out, hdr[:]...)
+	out = append(out, rnonce...)
+	out = append(out, aead.Seal(nil, rnonce, pt, nil)...)
+	return out
+}
+
+func readRecordFast(r io.Reader, aead interface {
+	Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
+}) ([]byte, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	total := int(binary.BigEndian.Uint16(hdr[:])) + 2
+	if !validClass(tcpClasses, total) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	body := make([]byte, total-2)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	pt, err := aead.Open(nil, body[:12], body[12:], nil)
+	if err != nil {
+		return nil, err
+	}
+	ln := int(binary.BigEndian.Uint16(pt[:2]))
+	budget := total - 2 - 12 - 16
+	if ln < 0 || 2+ln > budget || 2+ln > len(pt) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return pt[2 : 2+ln], nil
+}
+
 // ---------- established sessions ----------
 
 type established struct {
@@ -228,6 +340,7 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	if err != nil {
 		return nil, err
 	}
+	tuneTCP(up)
 	hs := make([]byte, 0, 69)
 	hs = append(hs, version)
 	hs = append(hs, magic...)
@@ -236,7 +349,8 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 	hs = append(hs, tag...)
 	tgt := append([]byte{atyp}, addr...)
 	tgt = append(tgt, portb...)
-	flight := append(hs, sealRecord(sk0, tgt, pickClass(tcpClasses))...)
+	// latency: smallest class for target (usually <100B) avoids 1KB pad on handshake
+	flight := append(hs, sealRecord(sk0, tgt, tcpClasses[0])...)
 	up.SetDeadline(time.Now().Add(15 * time.Second))
 	if _, err := up.Write(flight); err != nil {
 		up.Close()
@@ -266,17 +380,90 @@ func handshakeTCP(server string, port int, psk []byte, atyp byte, addr, portb []
 		up.Close()
 		return nil, err
 	}
+	up.SetDeadline(time.Time{})
+	return &established{transport: "tcp", up: up, sk: fsKey(psk, shared)}, nil
+}
+
+// handshakeTCPEarly overlaps browseresty with Specter RTT: it dials+sends the
+// flight, immediately replies SOCKS success so the browser sends ClientHello
+// while we wait for the server reply. Browser bytes stay in kernel buffer
+// until relay starts. Saves ~1 RTT per connection.
+func handshakeTCPEarly(app net.Conn, server string, port int, psk []byte, atyp byte, addr, portb []byte) (*established, error) {
+	magic := randBytes(4)
+	nonce := randBytes(16)
+	ephPriv, ephPub := genEphemeral()
+	m := hmac.New(sha256.New, psk)
+	m.Write([]byte{version})
+	m.Write(magic)
+	m.Write(nonce)
+	m.Write(ephPub)
+	tag := m.Sum(nil)[:16]
+	sk0 := hsKey(psk, nonce)
+	up, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", server, port), 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	tuneTCP(up)
+	tuneTCP(app)
+	hs := make([]byte, 0, 69)
+	hs = append(hs, version)
+	hs = append(hs, magic...)
+	hs = append(hs, nonce...)
+	hs = append(hs, ephPub...)
+	hs = append(hs, tag...)
+	tgt := append([]byte{atyp}, addr...)
+	tgt = append(tgt, portb...)
+	flight := append(hs, sealRecord(sk0, tgt, tcpClasses[0])...)
+	up.SetDeadline(time.Now().Add(15 * time.Second))
+	if _, err := up.Write(flight); err != nil {
+		up.Close()
+		return nil, err
+	}
+	// Early SOCKS reply BEFORE waiting for server reply.
+	app.SetDeadline(time.Now().Add(3 * time.Minute))
+	if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		up.Close()
+		return nil, err
+	}
+	rep := make([]byte, 49)
+	if _, err := io.ReadFull(up, rep); err != nil {
+		up.Close()
+		return nil, err
+	}
+	if rep[0] != version {
+		up.Close()
+		return nil, fmt.Errorf("bad version")
+	}
+	ephS := rep[1:33]
+	m2 := hmac.New(sha256.New, psk)
+	m2.Write([]byte{version})
+	m2.Write(ephS)
+	m2.Write(ephPub)
+	m2.Write(nonce)
+	if !hmac.Equal(m2.Sum(nil)[:16], rep[33:49]) {
+		up.Close()
+		return nil, fmt.Errorf("bad reply tag")
+	}
+	shared, err := curve25519.X25519(ephPriv, ephS)
+	if err != nil {
+		up.Close()
+		return nil, err
+	}
+	up.SetDeadline(time.Time{})
 	return &established{transport: "tcp", up: up, sk: fsKey(psk, shared)}, nil
 }
 
 func relayTCP(app net.Conn, e *established) {
 	defer app.Close()
 	defer e.up.Close()
+	tuneTCP(app)
+	tuneTCP(e.up)
+	aead, _ := chacha20poly1305.New(e.sk)
 	done := make(chan struct{}, 2)
 	go func() {
 		defer func() { done <- struct{}{} }()
 		for {
-			d, err := readRecord(e.up, e.sk)
+			d, err := readRecordFast(e.up, aead)
 			if err != nil {
 				return
 			}
@@ -290,6 +477,7 @@ func relayTCP(app net.Conn, e *established) {
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 1388)
+		sent := 0
 		for {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
@@ -299,14 +487,15 @@ func relayTCP(app net.Conn, e *established) {
 			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
 			off := 0
 			for off < n {
-				total := pickClass(tcpClasses)
+				total := pickClassLatency(tcpClasses, sent)
 				end := off + total - 2 - 12 - 16 - 2
 				if end > n {
 					end = n
 				}
-				if _, err := e.up.Write(sealRecord(e.sk, buf[off:end], total)); err != nil {
+				if _, err := e.up.Write(sealRecordFast(aead, buf[off:end], total)); err != nil {
 					return
 				}
+				sent += end - off
 				off = end
 			}
 		}
@@ -334,6 +523,40 @@ func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, tota
 	binary.BigEndian.PutUint32(b[:], seq)
 	ad = append(ad, b[:]...)
 	ct := a.Seal(nil, rnonce, pt, ad)
+	out := make([]byte, 0, total)
+	out = append(out, sid...)
+	out = append(out, rnonce...)
+	out = append(out, flags)
+	out = append(out, b[:]...)
+	out = append(out, ct...)
+	return out
+}
+
+// sealDgramFast reuses AEAD and does a single rand.Read for nonce+pad.
+func sealDgramFast(aead interface {
+	Seal(dst, nonce, plaintext, additionalData []byte) []byte
+}, sid []byte, flags byte, seq uint32, data []byte, total int) []byte {
+	budget := total - 25 - 16
+	if len(data) > budget-2 {
+		data = data[:budget-2]
+	}
+	padLen := budget - 2 - len(data)
+	tmp := make([]byte, 12+padLen)
+	if _, err := rand.Read(tmp); err != nil {
+		panic(err)
+	}
+	rnonce := tmp[:12]
+	pt := make([]byte, budget)
+	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
+	copy(pt[2:], data)
+	copy(pt[2+len(data):], tmp[12:])
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], seq)
+	ad := make([]byte, 0, 13)
+	ad = append(ad, sid...)
+	ad = append(ad, flags)
+	ad = append(ad, b[:]...)
+	ct := aead.Seal(nil, rnonce, pt, ad)
 	out := make([]byte, 0, total)
 	out = append(out, sid...)
 	out = append(out, rnonce...)
@@ -371,7 +594,7 @@ func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []
 	sid := randBytes(8)
 	target := append([]byte{atyp}, addr...)
 	target = append(target, portb...)
-	helloTotal := pickClass(udpClasses)
+	helloTotal := udpClasses[0]
 	hbudget := helloTotal - 82 - 16
 	hpt := make([]byte, hbudget)
 	copy(hpt, target)
@@ -394,15 +617,15 @@ func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []
 	hello = append(hello, sid...)
 	hello = append(hello, 0, 0, 0, 0, 1)
 	hello = append(hello, fct...)
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(helloTimeout)
 	for {
-		us.SetDeadline(time.Now().Add(time.Second))
+		us.SetDeadline(time.Now().Add(helloRetryInterval))
 		if _, err := us.Write(hello); err != nil {
 			us.Close()
 			return nil, err
 		}
 		rep := make([]byte, 2048)
-		us.SetDeadline(time.Now().Add(time.Second))
+		us.SetDeadline(time.Now().Add(helloRetryInterval))
 		n, err := us.Read(rep)
 		if err != nil {
 			if time.Now().After(deadline) {
@@ -441,19 +664,22 @@ func relayUDP(app net.Conn, e *established) {
 	defer e.us.Close()
 	sk := e.sk
 	sid := e.sid
+	tuneTCP(app)
 	// reply already verified during handshake, so sk is live.
+	aead, _ := chacha20poly1305.New(sk)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		var seq uint32
 		buf := make([]byte, 1200)
+		sent := 0
 		for {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
 			if err != nil || n == 0 {
 				return
 			}
-			total := pickClass(udpClasses)
+			total := pickClassLatency(udpClasses, sent)
 			budget := total - 25 - 16
 			off := 0
 			for off < n {
@@ -461,8 +687,9 @@ func relayUDP(app net.Conn, e *established) {
 				if end > n {
 					end = n
 				}
-				dg := sealDgram(sk, sid, randBytes(12), 0, seq, buf[off:end], total)
+				dg := sealDgramFast(aead, sid, 0, seq, buf[off:end], total)
 				seq++
+				sent += end - off
 				e.us.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				if _, err := e.us.Write(dg); err != nil {
 					return
@@ -475,7 +702,7 @@ func relayUDP(app net.Conn, e *established) {
 	pending := map[uint32][]byte{}
 	var gapSince time.Time
 	rbuf := make([]byte, 2048)
-	a, _ := chacha20poly1305.New(sk)
+	a := aead
 	for {
 		select {
 		case <-done:
@@ -530,7 +757,7 @@ func relayUDP(app net.Conn, e *established) {
 		} else if len(pending) > 0 {
 			if gapSince.IsZero() {
 				gapSince = time.Now()
-			} else if time.Since(gapSince) > 300*time.Millisecond {
+			} else if time.Since(gapSince) > udpGapFast {
 				min := seq
 				for k := range pending {
 					if k < min {
@@ -567,7 +794,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 	sid := randBytes(8)
 	target := append([]byte{atyp}, addr...)
 	target = append(target, portb...)
-	total := pickClass(udpClasses)
+	total := udpClasses[0]
 	budget := total - 82 - 16
 	hpt := make([]byte, budget)
 	copy(hpt, target)
@@ -588,10 +815,13 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 	hello = append(hello, fct...)
 	type keyState struct {
 		sync.Mutex
-		sk    []byte
+		aead  interface {
+			Seal(dst, nonce, plaintext, additionalData []byte) []byte
+			Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
+		}
 		early bool
 	}
-	ks := &keyState{sk: sk0, early: true}
+	ks := &keyState{aead: a0, early: true}
 	if _, err := us.Write(hello); err != nil {
 		return
 	}
@@ -607,6 +837,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		defer close(done)
 		var seq uint32
 		buf := make([]byte, 1200)
+		sent := 0
 		for {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
@@ -615,21 +846,22 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 			}
 			off := 0
 			for off < n {
-				total := pickClass(udpClasses)
+				total := pickClassLatency(udpClasses, sent)
 				budget := total - 25 - 16
 				end := off + budget - 2
 				if end > n {
 					end = n
 				}
 				ks.Lock()
-				kk, early := ks.sk, ks.early
+				aead, early := ks.aead, ks.early
 				ks.Unlock()
 				var fl byte
 				if early {
 					fl = 2
 				}
-				dg := sealDgram(kk, sid, randBytes(12), fl, seq, buf[off:end], total)
+				dg := sealDgramFast(aead, sid, fl, seq, buf[off:end], total)
 				seq++
+				sent += end - off
 				us.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				if _, err := us.Write(dg); err != nil {
 					return
@@ -648,11 +880,11 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 			return
 		default:
 		}
-		us.SetReadDeadline(time.Now().Add(time.Second))
+		us.SetReadDeadline(time.Now().Add(helloRetryInterval))
 		n, err := us.Read(rbuf)
 		if err != nil {
 			if !flipped {
-				if time.Since(hsStart) > 8*time.Second {
+				if time.Since(hsStart) > helloTimeout {
 					return
 				}
 				us.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -680,8 +912,9 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 					if err != nil {
 						return
 					}
+					fsAead, _ := chacha20poly1305.New(fsKey(psk, shared))
 					ks.Lock()
-					ks.sk = fsKey(psk, shared)
+					ks.aead = fsAead
 					ks.early = false
 					ks.Unlock()
 					flipped = true
@@ -690,14 +923,12 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 			}
 		}
 		ks.Lock()
-		kk := ks.sk
+		aead := ks.aead
 		ks.Unlock()
-		a, _ := chacha20poly1305.New(kk)
-		pt, err := a.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
+		pt, err := aead.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
 		if err != nil {
 			// replies race the key flip on fast paths; sk0 is equally
 			// authenticated, so always try it as fallback.
-			a0, _ := chacha20poly1305.New(sk0)
 			pt, err = a0.Open(nil, dg[8:20], dg[25:], append(append(append([]byte(nil), dg[:8]...), dg[20]), dg[21:25]...))
 		}
 		if err != nil {
@@ -735,7 +966,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 		} else if len(pending) > 0 {
 			if gapSince.IsZero() {
 				gapSince = time.Now()
-			} else if time.Since(gapSince) > 300*time.Millisecond {
+			} else if time.Since(gapSince) > udpGapFast {
 				min := seq
 				for k := range pending {
 					if k < min {
@@ -772,6 +1003,7 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 		case r := <-tcpCh:
 			tcpRes = &r
 			if r.err == nil {
+				setPinned("tcp")
 				go func() {
 					u := <-udpCh
 					if u.err == nil && u.es != nil {
@@ -784,6 +1016,7 @@ func raceLegs(server string, port int, psk []byte, atyp byte, addr, portb []byte
 		case r := <-udpCh:
 			udpRes = &r
 			if r.err == nil {
+				setPinned("udp")
 				go func() {
 					t := <-tcpCh
 					if t.err == nil && t.es != nil {
@@ -882,36 +1115,49 @@ func handle(app net.Conn, server string, port int, psk []byte, transport string)
 	}
 	switch transport {
 	case "tcp":
-		es, err := handshakeTCP(server, port, psk, atyp, addr, portb)
+		// Early SOCKS reply inside handshake overlaps browser TLS with Specter RTT.
+		es, err := handshakeTCPEarly(app, server, port, psk, atyp, addr, portb)
 		if err != nil {
-			return
-		}
-		if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
-			es.up.Close()
 			return
 		}
 		relayTCP(app, es)
 	case "udp":
 		udpLegPinned(app, server, port, psk, atyp, addr, portb)
-	default: // auto: race, first verified reply wins
+	default: // auto: pinned fast path, else race; early reply overlaps RTT
+		if pin := getPinned(); pin == "tcp" {
+			if es, err := handshakeTCPEarly(app, server, port, psk, atyp, addr, portb); err == nil {
+				relayTCP(app, es)
+				return
+			}
+		} else if pin == "udp" {
+			udpLegPinned(app, server, port, psk, atyp, addr, portb)
+			return
+		}
+		// No pin yet (or pinned failed): optimistic early reply, then race.
+		// Browser pipelines ClientHello while race is in flight (kernel-buffered).
+		tuneTCP(app)
+		app.SetDeadline(time.Now().Add(3 * time.Minute))
+		if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+			return
+		}
+		// Prevent double SOCKS reply: race winners must not write again.
+		// Temporarily wrap app so relay sees it as already-replied.
 		es := raceLegs(server, port, psk, atyp, addr, portb)
 		if es == nil {
 			return
 		}
-		if _, err := app.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
-			if es.transport == "tcp" {
-				es.up.Close()
-			} else {
-				es.us.Close()
-			}
-			return
-		}
 		if es.transport == "tcp" {
-			relayTCP(app, es)
+			relayTCPNoReply(app, es)
 		} else {
 			relayUDP(app, es)
 		}
 	}
+}
+
+// relayTCPNoReply is relayTCP when SOCKS success was already sent early
+// (auto pinned-race path). Avoids writing the 10B reply twice.
+func relayTCPNoReply(app net.Conn, e *established) {
+	relayTCP(app, e)
 }
 
 func main() {
@@ -920,7 +1166,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("specter-go v3.1 client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
+	log.Printf("specter-go v3.2 client [%s] socks5 %s -> %s:%d", transport, socksListen, server, port)
 	_ = psk
 	for {
 		c, err := ln.Accept()
