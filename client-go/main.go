@@ -43,7 +43,7 @@ var errMuxUnsupported = errors.New("mux unsupported by server")
 
 // appVersion is the release version. Bump this one place on release;
 // the wire version above only changes on protocol breaks.
-const appVersion = "v3.5.0"
+const appVersion = "v3.5.1"
 
 var tcpClasses = []int{320, 576, 1024, 1420}
 var udpClasses = []int{576, 1024, 1280}
@@ -60,17 +60,39 @@ const (
 // First-flight retransmit: how many leading datagrams we keep copies of,
 // resend interval, and give-up age (then inner TCP retransmits if needed).
 const (
-	flightTrackMax   = 16
+	flightTrackMax    = 16
 	flightResendEvery = 250 * time.Millisecond
 	flightGiveUpAfter = 3 * time.Second
 )
 
 func pickClass(classes []int) int {
-	var b [1]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return classes[len(classes)-1]
+	return classes[int(cryptoRand(1)[0])%len(classes)]
+}
+
+// cryptoRand doles CSPRNG bytes from 64KB slabs: one getrandom syscall per
+// ~64KB of nonce/pad/class output instead of 1-2 per record. Output is
+// identically distributed (slices of kernel CSPRNG output); only the
+// syscall pattern changes. This is the bulk-throughput ceiling lever:
+// records/s ≈ 1/(seal + read + write + getrandom).
+var randPoolMu sync.Mutex
+var randPoolBuf []byte
+var randPoolOff int
+
+func cryptoRand(n int) []byte {
+	randPoolMu.Lock()
+	defer randPoolMu.Unlock()
+	if len(randPoolBuf)-randPoolOff < n {
+		nb := make([]byte, 64<<10)
+		if _, err := rand.Read(nb); err != nil {
+			panic(err)
+		}
+		randPoolBuf = nb
+		randPoolOff = 0
 	}
-	return classes[int(b[0])%len(classes)]
+	out := make([]byte, n)
+	copy(out, randPoolBuf[randPoolOff:randPoolOff+n])
+	randPoolOff += n
+	return out
 }
 
 func validClass(classes []int, total int) bool {
@@ -268,11 +290,7 @@ func genEphemeral() (priv, pub []byte) {
 }
 
 func randBytes(n int) []byte {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
-	}
-	return b
+	return cryptoRand(n)
 }
 
 // ---------- TCP records ----------
@@ -285,9 +303,7 @@ func sealRecord(sk, data []byte, total int) []byte {
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
 	copy(pt[2:], data)
-	if _, err := rand.Read(pt[2+len(data):]); err != nil {
-		panic(err)
-	}
+	copy(pt[2+len(data):], cryptoRand(budget-2-len(data)))
 	a, _ := chacha20poly1305.New(sk)
 	rnonce := randBytes(12)
 	out := make([]byte, 0, total)
@@ -325,8 +341,8 @@ func readRecord(r io.Reader, sk []byte) ([]byte, error) {
 	return pt[2 : 2+ln], nil
 }
 
-// sealRecordFast reuses the per-connection AEAD and does a single rand.Read
-// for nonce+pad instead of two syscalls.
+// sealRecordFast reuses the per-connection AEAD and takes nonce+pad from
+// the pooled CSPRNG (no syscall on the hot path).
 func sealRecordFast(aead interface {
 	Seal(dst, nonce, plaintext, additionalData []byte) []byte
 }, data []byte, total int) []byte {
@@ -335,11 +351,8 @@ func sealRecordFast(aead interface {
 		data = data[:budget-2]
 	}
 	padLen := budget - 2 - len(data)
-	// one CSPRNG read for nonce (12) + pad
-	tmp := make([]byte, 12+padLen)
-	if _, err := rand.Read(tmp); err != nil {
-		panic(err)
-	}
+	// one pooled read for nonce (12) + pad
+	tmp := cryptoRand(12 + padLen)
 	rnonce := tmp[:12]
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
@@ -441,7 +454,7 @@ func closeWrite(c net.Conn) {
 
 type established struct {
 	transport string
-	up        net.Conn  // tcp
+	up        net.Conn     // tcp
 	us        *net.UDPConn // udp
 	sk        []byte
 	sid       []byte // udp
@@ -613,7 +626,7 @@ func relayTCP(app net.Conn, e *established) {
 				return
 			}
 			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
-			app.SetDeadline(time.Now().Add(3 * time.Minute))
+			app.SetWriteDeadline(time.Now().Add(3 * time.Minute))
 			if _, err := app.Write(d); err != nil {
 				logf(logDebug, "tcp relay app write end err=%v", err)
 				return
@@ -628,10 +641,14 @@ func relayTCP(app net.Conn, e *established) {
 			app.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := app.Read(buf)
 			if err != nil || n == 0 {
-				logf(logDebug, "tcp relay app->server end err=%v", err)
+				if err == nil {
+					logf(logDebug, "tcp relay app->server end: empty read")
+				} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+					logf(logDebug, "tcp relay app->server end err=%v", err)
+				}
 				return
 			}
-			e.up.SetDeadline(time.Now().Add(3 * time.Minute))
+			e.up.SetWriteDeadline(time.Now().Add(3 * time.Minute))
 			off := 0
 			for off < n {
 				total := pickClassLatency(tcpClasses, sent)
@@ -753,9 +770,7 @@ func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, tota
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
 	copy(pt[2:], data)
-	if _, err := rand.Read(pt[2+len(data):]); err != nil {
-		panic(err)
-	}
+	copy(pt[2+len(data):], cryptoRand(budget-2-len(data)))
 	a, _ := chacha20poly1305.New(sk)
 	ad := make([]byte, 0, 13)
 	ad = append(ad, sid...)
@@ -773,7 +788,7 @@ func sealDgram(sk, sid, rnonce []byte, flags byte, seq uint32, data []byte, tota
 	return out
 }
 
-// sealDgramFast reuses AEAD and does a single rand.Read for nonce+pad.
+// sealDgramFast reuses AEAD and takes nonce+pad from the pooled CSPRNG.
 func sealDgramFast(aead interface {
 	Seal(dst, nonce, plaintext, additionalData []byte) []byte
 }, sid []byte, flags byte, seq uint32, data []byte, total int) []byte {
@@ -782,10 +797,7 @@ func sealDgramFast(aead interface {
 		data = data[:budget-2]
 	}
 	padLen := budget - 2 - len(data)
-	tmp := make([]byte, 12+padLen)
-	if _, err := rand.Read(tmp); err != nil {
-		panic(err)
-	}
+	tmp := cryptoRand(12 + padLen)
 	rnonce := tmp[:12]
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
@@ -839,10 +851,7 @@ func handshakeUDP(server string, port int, psk []byte, atyp byte, addr, portb []
 	hbudget := helloTotal - 82 - 16
 	hpt := make([]byte, hbudget)
 	copy(hpt, target)
-	if _, err := rand.Read(hpt[len(target):]); err != nil {
-		us.Close()
-		return nil, err
-	}
+	copy(hpt[len(target):], cryptoRand(hbudget-len(target)))
 	a, _ := chacha20poly1305.New(sk0)
 	fad := make([]byte, 0, 13)
 	fad = append(fad, sid...)
@@ -1051,9 +1060,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 	budget := total - 82 - 16
 	hpt := make([]byte, budget)
 	copy(hpt, target)
-	if _, err := rand.Read(hpt[len(target):]); err != nil {
-		return
-	}
+	copy(hpt[len(target):], cryptoRand(budget-len(target)))
 	a0, _ := chacha20poly1305.New(sk0)
 	fad := append(append(append([]byte(nil), sid...), udpFlagHello|udpFlagAckCap), 0, 0, 0, 0)
 	fct := a0.Seal(nil, hsNonce[:12], hpt, fad)
@@ -1068,7 +1075,7 @@ func udpLegPinned(app net.Conn, server string, port int, psk []byte, atyp byte, 
 	hello = append(hello, fct...)
 	type keyState struct {
 		sync.Mutex
-		aead  interface {
+		aead interface {
 			Seal(dst, nonce, plaintext, additionalData []byte) []byte
 			Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
 		}
@@ -1383,6 +1390,7 @@ type muxCapEntry struct {
 
 var muxCapMu sync.Mutex
 var muxCapCache = map[string]muxCapEntry{}
+
 const muxCapTTL = 5 * time.Minute
 
 func muxServerKey(server string, port int) string {
@@ -1559,7 +1567,7 @@ func (t *muxTrunk) openStream(app net.Conn, atyp byte, addr, portb []byte) error
 					return
 				}
 				atomic.AddInt64(&t.buffered, -int64(len(chunk)))
-				app.SetDeadline(time.Now().Add(3 * time.Minute))
+				app.SetWriteDeadline(time.Now().Add(3 * time.Minute))
 				if _, err := app.Write(chunk); err != nil {
 					return
 				}

@@ -31,13 +31,13 @@ import (
 )
 
 const (
-	version     = 0x03 // wire protocol version (NOT the app release)
-	muxVersion  = 0x04 // same wire, muxed streams (needs muxOn)
-	maxConns    = 1024
-	dialTO      = 10 * time.Second
-	nonceTTL    = 10 * time.Minute
-	udpIdle     = 120 * time.Second
-	udpGap      = 100 * time.Millisecond
+	version    = 0x03 // wire protocol version (NOT the app release)
+	muxVersion = 0x04 // same wire, muxed streams (needs muxOn)
+	maxConns   = 1024
+	dialTO     = 10 * time.Second
+	nonceTTL   = 10 * time.Minute
+	udpIdle    = 120 * time.Second
+	udpGap     = 100 * time.Millisecond
 
 	udpMaxPayload = 1200
 
@@ -51,7 +51,7 @@ const (
 
 // appVersion is the release version. Bump this one place on release;
 // the wire version above only changes on protocol breaks.
-const appVersion = "v3.5.0"
+const appVersion = "v3.5.1"
 
 // Record size classes (totals on the wire). TCP records carry a 2-byte
 // length prefix; UDP sizes come from datagram boundaries.
@@ -59,11 +59,33 @@ var tcpClasses = []int{320, 576, 1024, 1420}
 var udpClasses = []int{576, 1024, 1280}
 
 func pickClass(classes []int) int {
-	var b [1]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return classes[len(classes)-1]
+	return classes[int(cryptoRand(1)[0])%len(classes)]
+}
+
+// cryptoRand doles CSPRNG bytes from 64KB slabs: one getrandom syscall per
+// ~64KB of nonce/pad/class output instead of 1-2 per record. Output is
+// identically distributed (slices of kernel CSPRNG output); only the
+// syscall pattern changes. This is the bulk-throughput ceiling lever:
+// records/s ≈ 1/(seal + read + write + getrandom).
+var randPoolMu sync.Mutex
+var randPoolBuf []byte
+var randPoolOff int
+
+func cryptoRand(n int) []byte {
+	randPoolMu.Lock()
+	defer randPoolMu.Unlock()
+	if len(randPoolBuf)-randPoolOff < n {
+		nb := make([]byte, 64<<10)
+		if _, err := rand.Read(nb); err != nil {
+			panic(err)
+		}
+		randPoolBuf = nb
+		randPoolOff = 0
 	}
-	return classes[int(b[0])%len(classes)]
+	out := make([]byte, n)
+	copy(out, randPoolBuf[randPoolOff:randPoolOff+n])
+	randPoolOff += n
+	return out
 }
 
 func pickClassLatency(classes []int, bytesSent int) int {
@@ -422,10 +444,7 @@ func hsKey(hsNonce []byte) []byte {
 }
 
 func genEphemeral() (priv, pub []byte) {
-	priv = make([]byte, 32)
-	if _, err := rand.Read(priv); err != nil {
-		panic(err)
-	}
+	priv = cryptoRand(32)
 	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
 	if err != nil {
 		panic(err)
@@ -485,14 +504,9 @@ func sealRecord(sk, data []byte, total int) []byte {
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
 	copy(pt[2:], data)
-	if _, err := rand.Read(pt[2+len(data):]); err != nil {
-		panic(err)
-	}
+	copy(pt[2+len(data):], cryptoRand(budget-2-len(data)))
 	a, _ := chacha20poly1305.New(sk)
-	rnonce := make([]byte, 12)
-	if _, err := rand.Read(rnonce); err != nil {
-		panic(err)
-	}
+	rnonce := cryptoRand(12)
 	out := make([]byte, 0, total)
 	var hdr [2]byte
 	binary.BigEndian.PutUint16(hdr[:], uint16(total-2))
@@ -510,10 +524,7 @@ func sealRecordFast(aead interface {
 		data = data[:budget-2]
 	}
 	padLen := budget - 2 - len(data)
-	tmp := make([]byte, 12+padLen)
-	if _, err := rand.Read(tmp); err != nil {
-		panic(err)
-	}
+	tmp := cryptoRand(12 + padLen)
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], uint16(len(data)))
 	copy(pt[2:], data)
@@ -565,6 +576,7 @@ func readRecord(r io.Reader, sk []byte) ([]byte, error) {
 func readRecordFast(r io.Reader, aead interface {
 	Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
 }) ([]byte, error) {
+
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
@@ -629,6 +641,13 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// Deadline discipline (load-bearing): no pump uses SHORT read deadlines,
+// so a reader's deadline is never at risk — but if short deadlines are ever
+// reintroduced, every WRITER on a shared conn must use SetWriteDeadline
+// (write-only). A single SetDeadline (both directions) from a sibling pump
+// would clobber a short read deadline and hang that reader. Audit any new
+// conn sharing against this rule.
 
 // muxOn gates 0x04 sessions. SPECTER_MUX=off enforces legacy-only;
 // anything else (incl. unset) enables mux. No guard.sh change needed.
@@ -793,7 +812,7 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 			if err != nil {
 				return
 			}
-			t.SetDeadline(time.Now().Add(3 * time.Minute))
+			t.SetWriteDeadline(time.Now().Add(3 * time.Minute))
 			if _, err := t.Write(d); err != nil {
 				return
 			}
@@ -803,13 +822,17 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 1388)
 		sent := 0
+		var recs, payload int64
+		defer func() {
+			logf(logDebug, "tcp down recs=%d payload=%d", recs, payload)
+		}()
 		for {
 			t.SetDeadline(time.Now().Add(3 * time.Minute))
 			n, err := t.Read(buf)
 			if err != nil || n == 0 {
 				return
 			}
-			c.SetDeadline(time.Now().Add(3 * time.Minute))
+			c.SetWriteDeadline(time.Now().Add(3 * time.Minute))
 			off := 0
 			for off < n {
 				total := pickClassLatency(tcpClasses, sent)
@@ -821,12 +844,17 @@ func handleTCP(c net.Conn, sem chan struct{}) {
 					return
 				}
 				sent += end - off
+				recs++
+				payload += int64(end - off)
 				off = end
 			}
 		}
 	}()
 	<-done
 }
+
+// muxDbgRecs/muxDbgBytes count mux DATA records+payload (debug only).
+var muxDbgRecs, muxDbgBytes int64
 
 // ---------- mux dispatcher (0x04 TCP sessions) ----------
 
@@ -915,6 +943,8 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 			if err != nil {
 				return err
 			}
+			atomic.AddInt64(&muxDbgRecs, 1)
+			atomic.AddInt64(&muxDbgBytes, int64(n))
 			data = data[n:]
 		}
 		return nil
@@ -1053,56 +1083,56 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 			for _, ch := range p.chunks {
 				feed(st, ch, false) // already counted at park time
 			}
-		done := make(chan struct{}, 2)
-		winAcc := 0
-		go func() { // trunk -> target
-			defer func() { done <- struct{}{} }()
-			for {
-				select {
-				case chunk := <-st.q:
-					if chunk == nil {
-						closeWrite(t)
+			done := make(chan struct{}, 2)
+			winAcc := 0
+			go func() { // trunk -> target
+				defer func() { done <- struct{}{} }()
+				for {
+					select {
+					case chunk := <-st.q:
+						if chunk == nil {
+							closeWrite(t)
+							return
+						}
+						atomic.AddInt64(&buffered, -int64(len(chunk)))
+						t.SetWriteDeadline(time.Now().Add(3 * time.Minute))
+						if _, err := t.Write(chunk); err != nil {
+							return
+						}
+						// Grant the sender more credit as we consume.
+						winAcc += len(chunk)
+						if winAcc >= muxWinQuantum {
+							winAcc -= muxWinQuantum
+							_ = sendFrame(0, 0, winSid(sid))
+						}
+					case <-st.dead:
 						return
 					}
-					atomic.AddInt64(&buffered, -int64(len(chunk)))
+				}
+			}()
+			go func() { // target -> trunk
+				defer func() { done <- struct{}{} }()
+				buf := make([]byte, 1388)
+				for {
 					t.SetDeadline(time.Now().Add(3 * time.Minute))
-					if _, err := t.Write(chunk); err != nil {
+					n, err := t.Read(buf)
+					if err != nil || n == 0 {
 						return
 					}
-					// Grant the sender more credit as we consume.
-					winAcc += len(chunk)
-					if winAcc >= muxWinQuantum {
-						winAcc -= muxWinQuantum
-						_ = sendFrame(0, 0, winSid(sid))
+					if !waitWindow(&st.sendWin, &st.gotWin, n, st.dead) {
+						return
 					}
-				case <-st.dead:
-					return
+					if err := writeData(sid, buf[:n]); err != nil {
+						return
+					}
+					atomic.AddInt64(&st.sendWin, -int64(n))
 				}
-			}
-		}()
-		go func() { // target -> trunk
-			defer func() { done <- struct{}{} }()
-			buf := make([]byte, 1388)
-			for {
-				t.SetDeadline(time.Now().Add(3 * time.Minute))
-				n, err := t.Read(buf)
-				if err != nil || n == 0 {
-					return
-				}
-				if !waitWindow(&st.sendWin, &st.gotWin, n, st.dead) {
-					return
-				}
-				if err := writeData(sid, buf[:n]); err != nil {
-					return
-				}
-				atomic.AddInt64(&st.sendWin, -int64(n))
-			}
-		}()
-		go func() { // reaper: both directions done -> teardown
-			<-done
-			<-done
-			killStream(sid)
-		}()
+			}()
+			go func() { // reaper: both directions done -> teardown
+				<-done
+				<-done
+				killStream(sid)
+			}()
 		}()
 	}
 
@@ -1196,6 +1226,8 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 	for _, id := range ids {
 		killStream(id)
 	}
+	logf(logDebug, "mux trunk stats recs=%d payload=%d",
+		atomic.LoadInt64(&muxDbgRecs), atomic.LoadInt64(&muxDbgBytes))
 	if len(ids) > 0 {
 		logf(logWarn, "mux trunk dead remote=%s reset=%d streams", remote, len(ids))
 	}
@@ -1519,10 +1551,7 @@ func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s
 			}
 			ptLen := end - off
 			padLen := budget - 2 - ptLen
-			tmp := make([]byte, 12+padLen)
-			if _, err := rand.Read(tmp); err != nil {
-				break
-			}
+			tmp := cryptoRand(12 + padLen)
 			pt := make([]byte, budget)
 			binary.BigEndian.PutUint16(pt[:2], uint16(ptLen))
 			copy(pt[2:], buf[off:end])
@@ -1574,7 +1603,7 @@ func deliverUDP(s *udpSession, seq uint32, data []byte) {
 		return
 	}
 	write := func(d []byte) bool {
-		s.target.SetDeadline(time.Now().Add(30 * time.Second))
+		s.target.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err := s.target.Write(d)
 		if err != nil {
 			logf(logDebug, "udp deliver write fail sid=%x err=%v", s.sid, err)
@@ -1645,10 +1674,7 @@ func helloReply(sid, ephS, ephC, nonce []byte, total int) []byte {
 	out = append(out, sid...)
 	out = append(out, ephS...)
 	out = append(out, m.Sum(nil)[:16]...)
-	pad := make([]byte, total-len(out))
-	if _, err := rand.Read(pad); err != nil {
-		panic(err)
-	}
+	pad := cryptoRand(total - len(out))
 	return append(out, pad...)
 }
 
@@ -1874,10 +1900,7 @@ func maybeAck(conn *net.UDPConn, s *udpSession) {
 	}
 	total := udpClasses[0]
 	budget := total - 25 - 16
-	tmp := make([]byte, 12+budget-2-8)
-	if _, err := rand.Read(tmp); err != nil {
-		return
-	}
+	tmp := cryptoRand(12 + budget - 2 - 8)
 	pt := make([]byte, budget)
 	binary.BigEndian.PutUint16(pt[:2], 8)
 	binary.BigEndian.PutUint32(pt[2:6], cumul)
