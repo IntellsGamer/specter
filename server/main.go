@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"hash"
 	"io"
 	"log"
@@ -446,6 +447,19 @@ type pacer struct {
 	last   time.Time
 }
 
+// udpMbps reads SPECTER_UDP_MBPS (default 40). Raise on fast paths,
+// lower on thin/lossy ones. Throughput can never exceed what the path
+// and the client's reorder buffer sustain.
+func udpMbps() float64 {
+	if v := os.Getenv("SPECTER_UDP_MBPS"); v != "" {
+		var f float64
+		if _, err := fmt.Sscanf(v, "%f", &f); err == nil && f >= 1 && f <= 10000 {
+			return f
+		}
+	}
+	return 40
+}
+
 func newPacer(bps float64) *pacer {
 	return &pacer{rate: bps, tokens: 65536, last: time.Now()}
 }
@@ -475,7 +489,7 @@ func (p *pacer) wait(n int) {
 
 func udpPump(conn *net.UDPConn, key string, addr *net.UDPAddr, sid, sk []byte, s *udpSession) {
 	buf := make([]byte, udpMaxPayload)
-	pacer := newPacer(40 << 20) // ~40 Mbps smooths bursts past socket buffers
+	pacer := newPacer(udpMbps() * (1 << 20)) // smooths bursts past socket buffers
 	for {
 		s.target.SetDeadline(time.Now().Add(3 * time.Minute))
 		n, err := s.target.Read(buf)
