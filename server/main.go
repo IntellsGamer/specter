@@ -298,6 +298,17 @@ type cachedIPs struct {
 
 const maxCachedIPs = 4
 
+// dnsFlight dedups concurrent resolutions of the same host (browsing
+// fan-out: 20 streams to a new domain must not fire 20 identical DNS
+// queries). First goroutine resolves, the rest wait on its result.
+type dnsCall struct {
+	done chan struct{}
+	ips  []string
+}
+
+var dnsFlightMu sync.Mutex
+var dnsFlight = map[string]*dnsCall{}
+
 func resolveHostList(host string) []string {
 	if ip := net.ParseIP(host); ip != nil {
 		return []string{host}
@@ -310,7 +321,40 @@ func resolveHostList(host string) []string {
 		return ips
 	}
 	dnsCache.Unlock()
-	// Resolve outside lock (may block). Never pass nil ctx here: net's
+	dnsFlightMu.Lock()
+	if c, ok := dnsFlight[host]; ok {
+		dnsFlightMu.Unlock()
+		<-c.done
+		return c.ips
+	}
+	c := &dnsCall{done: make(chan struct{})}
+	dnsFlight[host] = c
+	dnsFlightMu.Unlock()
+	ips := lookupHostList(host)
+	c.ips = ips
+	dnsCache.Lock()
+	dnsCache.m[host] = cachedIPs{ips: ips, exp: time.Now().Add(dnsCacheTTL)}
+	if len(dnsCache.m) > 10000 {
+		sweepDNSLocked(time.Now())
+	}
+	dnsCache.Unlock()
+	dnsFlightMu.Lock()
+	delete(dnsFlight, host)
+	close(c.done)
+	dnsFlightMu.Unlock()
+	return ips
+}
+
+func sweepDNSLocked(now time.Time) {
+	for k, v := range dnsCache.m {
+		if now.After(v.exp) {
+			delete(dnsCache.m, k)
+		}
+	}
+}
+
+func lookupHostList(host string) []string {
+	// Resolve outside locks (may block). Never pass nil ctx here: net's
 	// lookup path dereferences it and panics (crashed v3.2.0 on domains).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -338,17 +382,6 @@ func resolveHostList(host string) []string {
 			ips = append(ips, a.IP.String())
 		}
 	}
-	dnsCache.Lock()
-	dnsCache.m[host] = cachedIPs{ips: ips, exp: now.Add(dnsCacheTTL)}
-	// opportunistic sweep
-	if len(dnsCache.m) > 10000 {
-		for k, v := range dnsCache.m {
-			if now.After(v.exp) {
-				delete(dnsCache.m, k)
-			}
-		}
-	}
-	dnsCache.Unlock()
 	return ips
 }
 
@@ -795,6 +828,16 @@ type muxServerStream struct {
 	dead   chan struct{}
 }
 
+// muxPending holds frames that arrived before their stream's async dial
+// finished (SYNs must not block the read loop, so dials run in background
+// and early DATA parks here, flushed in order on insert).
+type muxPending struct {
+	chunks [][]byte
+	bytes  int
+}
+
+const muxPendBytesCap = 1 << 20
+
 // handleMux takes over a verified 0x04 connection (sem released by caller
 // on return). One TCP trunk carries many streams; frames arrive in order.
 func handleMux(c net.Conn, aead cipher.AEAD) {
@@ -803,6 +846,7 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 	tuneTCP(c)
 	var mu sync.Mutex
 	streams := map[uint32]*muxServerStream{}
+	pending := map[uint32]*muxPending{}
 	var wmu sync.Mutex
 	var sentBytes int
 	var buffered int64
@@ -849,39 +893,117 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 			st.target.Close()
 		}
 	}
+	// feed enqueues one chunk (nil = FIN marker) to a live stream.
+	// count=false when moving already-counted parked bytes.
+	feed := func(st *muxServerStream, chunk []byte, count bool) {
+		if chunk != nil && count {
+			atomic.AddInt64(&buffered, int64(len(chunk)))
+		}
+		select {
+		case st.q <- chunk:
+		case <-st.dead:
+			if chunk != nil && count {
+				atomic.AddInt64(&buffered, -int64(len(chunk)))
+			}
+		}
+	}
+	// park stashes a pre-insert frame for a dialing stream.
+	// Returns false when there is nothing to park into (caller RSTs).
+	park := func(sid uint32, chunk []byte) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		p, ok := pending[sid]
+		if !ok {
+			return false
+		}
+		if chunk != nil {
+			if p.bytes+len(chunk) > muxPendBytesCap {
+				return false
+			}
+			p.bytes += len(chunk)
+			atomic.AddInt64(&buffered, int64(len(chunk)))
+		}
+		p.chunks = append(p.chunks, chunk)
+		return true
+	}
+	dropPending := func(sid uint32) {
+		mu.Lock()
+		if p, ok := pending[sid]; ok {
+			delete(pending, sid)
+			atomic.AddInt64(&buffered, -int64(p.bytes))
+		}
+		mu.Unlock()
+	}
 	openStream := func(sid uint32, tgt []byte) {
 		mu.Lock()
-		n := len(streams)
+		_, dupStream := streams[sid]
+		_, dupPend := pending[sid]
+		full := len(streams)+len(pending) >= muxMaxStreams
+		if !dupStream && !dupPend && !full {
+			pending[sid] = &muxPending{}
+		}
 		mu.Unlock()
-		if n >= muxMaxStreams {
+		switch {
+		case dupStream || dupPend:
+			return // dup SYN: ignore (client never resends)
+		case full:
 			logRL("mux", logWarn, 10*time.Second, "stream cap %d, refusing sid=%d from %s", muxMaxStreams, sid, remote)
 			_ = sendFrame(sid, muxSYNFAIL, nil)
 			return
 		}
-		host, rest, ok := parseAddr(tgt)
-		if !ok || len(rest) != 2 {
-			_ = sendFrame(sid, muxSYNFAIL, nil)
-			return
-		}
-		t, err := dialTarget("mux", host, itoa(int(binary.BigEndian.Uint16(rest[:2]))))
-		if err != nil {
-			_ = sendFrame(sid, muxSYNFAIL, nil)
-			return
-		}
-		tuneTCP(t)
-		st := &muxServerStream{id: sid, target: t, q: make(chan []byte, 256), dead: make(chan struct{})}
-		mu.Lock()
-		if _, dup := streams[sid]; dup {
+		// Dial off-loop: the read loop must never block on dial latency
+		// or N parallel SYNs serialize into N sequential dials.
+		go func() {
+			host, rest, ok := parseAddr(tgt)
+			var t net.Conn
+			var err error
+			if ok && len(rest) == 2 {
+				t, err = dialTarget("mux", host, itoa(int(binary.BigEndian.Uint16(rest[:2]))))
+			} else {
+				err = fmt.Errorf("bad target")
+			}
+			// Single critical section: pop pending AND insert the stream
+			// atomically, so a racing DATA frame always finds exactly one
+			// of the two and never draws a bogus RST.
+			mu.Lock()
+			p, still := pending[sid]
+			if still {
+				delete(pending, sid)
+			}
+			var st *muxServerStream
+			var dup bool
+			if still && err == nil {
+				if _, dup = streams[sid]; !dup {
+					st = &muxServerStream{id: sid, target: t, q: make(chan []byte, 256), dead: make(chan struct{})}
+					streams[sid] = st
+				}
+			}
 			mu.Unlock()
-			t.Close()
-			return
-		}
-		streams[sid] = st
-		mu.Unlock()
-		if err := sendFrame(sid, muxSYNACK, nil); err != nil {
-			killStream(sid)
-			return
-		}
+			if !still {
+				if t != nil {
+					t.Close()
+				}
+				return // RST raced us; peer already gone
+			}
+			if err != nil || dup {
+				atomic.AddInt64(&buffered, -int64(p.bytes))
+				if t != nil {
+					t.Close()
+				}
+				if err != nil && !dup {
+					_ = sendFrame(sid, muxSYNFAIL, nil)
+				}
+				return
+			}
+			tuneTCP(t)
+			if serr := sendFrame(sid, muxSYNACK, nil); serr != nil {
+				killStream(sid)
+				atomic.AddInt64(&buffered, -int64(p.bytes))
+				return
+			}
+			for _, ch := range p.chunks {
+				feed(st, ch, false) // already counted at park time
+			}
 		done := make(chan struct{}, 2)
 		go func() { // trunk -> target
 			defer func() { done <- struct{}{} }()
@@ -921,6 +1043,7 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 			<-done
 			killStream(sid)
 		}()
+		}()
 	}
 
 	for {
@@ -946,41 +1069,49 @@ func handleMux(c net.Conn, aead cipher.AEAD) {
 		case flags&(muxFIN|muxRST) != 0:
 			mu.Lock()
 			st, known := streams[sid]
+			_, pend := pending[sid]
 			mu.Unlock()
 			if known {
 				if len(data) > 0 {
-					atomic.AddInt64(&buffered, int64(len(data)))
-					select {
-					case st.q <- data:
-					case <-st.dead:
-						atomic.AddInt64(&buffered, -int64(len(data)))
-					}
+					feed(st, data, true)
 				}
 				if flags&muxFIN != 0 {
 					// Ordered trunk: all DATA precedes this FIN.
-					select {
-					case st.q <- nil:
-					case <-st.dead:
-					}
+					feed(st, nil, false)
 				}
 				if flags&muxRST != 0 {
 					killStream(sid)
+				}
+			} else if pend {
+				if len(data) > 0 && !park(sid, data) {
+					dropPending(sid)
+					_ = sendFrame(sid, muxRST, nil)
+				} else {
+					if flags&muxFIN != 0 {
+						park(sid, nil)
+					}
+					if flags&muxRST != 0 {
+						dropPending(sid)
+					}
 				}
 			}
 		default: // DATA (possibly with stray bits)
 			mu.Lock()
 			st, known := streams[sid]
+			_, pend := pending[sid]
 			mu.Unlock()
-			if !known {
-				_ = sendFrame(sid, muxRST, nil)
+			if known {
+				feed(st, data, true)
 				continue
 			}
-			atomic.AddInt64(&buffered, int64(len(data)))
-			select {
-			case st.q <- data:
-			case <-st.dead:
-				atomic.AddInt64(&buffered, -int64(len(data)))
+			if pend {
+				if !park(sid, data) {
+					dropPending(sid)
+					_ = sendFrame(sid, muxRST, nil)
+				}
+				continue
 			}
+			_ = sendFrame(sid, muxRST, nil)
 		}
 	}
 	// Trunk dead: reset everything so clients retrunk on demand.
